@@ -1,19 +1,22 @@
 #! python3
 from bitstream import BitStream
 from numpy import int8, uint8
-from zlib import crc32
+from crcmod import predefined
 
 TSC_OPTION = ["Not scrambled", "Reserved for future use",
               "Scrambled with even key", "Scrambled with odd key"]
 PFMT = ("\033[0;44m[%04d]\033[42m(%02d)\033[0m %d|%d|%d %d|%d "
         "<\033[1;92m%.3f%%\033[0m> %s")
 RFMT = "\033[1;31m%s\033[0m"
-S3, S4, S5 = " " * 3, " " * 4, " " * 5
+S = " " * 3
 PACKET_SIZE = 184 * 8  # In bits
 
 PES_MASK = 0b000000000000000000000001
 MIP_MASK = 0b010001111110000000001111
 TEI_MASK = 0b000000001000000000000000
+
+
+crc32 = predefined.mkCrcFun("crc-32-mpeg")
 
 
 def read_uint(stream, n):
@@ -40,7 +43,7 @@ class Stream():
             if data:
                 self.parse_payload(data, 1)
         if self.cIncomplete:
-            print(S3 + RFMT % "Incomplete payload")
+            print(S + RFMT % "Incomplete payload")
 
     def parse_adaptation(self, data, n=0):
         (discontinuity, rai, streamPriority, pcrF, opcrF, spliceF,
@@ -130,7 +133,7 @@ class Stream():
             self.cIncomplete = True
         if syntaxF and length:
             syntax = data.read(BitStream, length * 8)
-            copy.write(syntax.copy(length - 32))
+            copy.write(syntax.copy(length * 8 - 32))
             tableIdExtension = read_uint(syntax, 16)
             syntax.read(bool, 2)
             version = read_uint(syntax, 5)
@@ -146,13 +149,15 @@ class Stream():
                 text = ("CRC does not match (0x%x vs 0x%x)" %
                         (originalCrc, myCrc))
                 tprint(n, RFMT % text)
+                return
             if not (self.cPid or tableId or privateBitF):
                 while tableData:
                     programNum = read_uint(tableData, 16)
                     tableData.read(bool, 3)
                     programPid = read_uint(tableData, 13)
                     tprint(n + 1, "PAT %d - %d" % (programNum, programPid))
-                    self.pat[programPid] = programNum
+                    if currentF:
+                        self.pat[programPid] = programNum
             elif self.cPid in self.pat and not privateBitF:
                 tableData.read(bool, 3)
                 pcrPid = read_uint(tableData, 13)
@@ -162,16 +167,19 @@ class Stream():
                 # TODO: Parse descriptors
                 # https://en.wikipedia.org/wiki/Program-specific_information#Descriptor
                 tprint(n + 1, str(programDescriptors))
-                streamType = tableData.read(uint8)
-                tableData.read(bool, 3)
-                elementatyPid = read_uint(tableData, 13)
-                tableData.read(bool, 4)
-                _length = read_uint(tableData, 12)
-                tprint(n + 1, "PMT[%d][%d](%d)(%d) PCR -> %d" %
-                       (elementatyPid, streamType, length, _length, pcrPid))
-                streamDescriptors = tableData.read(bytes, _length)
-                # TODO: Parse descriptors
-                tprint(n + 1, str(streamDescriptors))
+                while tableData:
+                    streamType = tableData.read(uint8)
+                    tableData.read(bool, 3)
+                    elementatyPid = read_uint(tableData, 13)
+                    tableData.read(bool, 4)
+                    _length = read_uint(tableData, 12)
+                    print(S * (n + 1) + "PMT[%d][%d](%d)(%d) PCR -> %d" %
+                          (elementatyPid, streamType, length, _length, pcrPid))
+                    streamDescriptors = tableData.read(bytes, _length)
+                    # TODO: Parse descriptors
+                    tprint(n + 1, str(streamDescriptors))
+            else:
+                tprint(n + 1, RFMT % "Neither PAT or PMT")
             if tableData:
                 tprint(n, str(tableData))
         if data:
@@ -180,6 +188,7 @@ class Stream():
             if all(stuffing):
                 tprint(n, "**%d Stuffing Bytes" % (length // 8))
             else:
+                return  # Only for debug purposes
                 raise Exception("Bits left in PSI: %s" %
                                 "".join("01"[i] for i in stuffing))
 
@@ -201,12 +210,13 @@ def main(path, targetPids=None, ignorePids=tuple(), onlyPusi=False):
             raise Exception("Sync should be 0x47, it is 0x%x" % sync)
         tei, pusi, priority = data.read(bool, 3)
         pid = read_uint(data, 13)
+        if pid in ignorePids:
+            data.read(bytes, 186)
+            continue
         tsc = TSC_OPTION[read_uint(data, 2)]
         adaptationF, payloadF = data.read(bool, 2)
         counter = read_uint(data, 4)
         left = data.read(BitStream, PACKET_SIZE)
-        if pid in ignorePids:
-            continue
         try:
             if (lastCounter[pid] + 1) % 16 != counter:
                 text = ("Counter discontinuity, from %d to %d" %
@@ -228,4 +238,4 @@ def main(path, targetPids=None, ignorePids=tuple(), onlyPusi=False):
 if __name__ == "__main__":
     path = ("/home/huxley/Desktop/20180727-145000"
             "-20180727-145500-RGE1_CAT2_REC.ts")
-    main(path, onlyPusi=True, targetPids=(0,))
+    main(path, onlyPusi=True)
