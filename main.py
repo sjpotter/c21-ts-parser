@@ -98,6 +98,7 @@ class Stream():
         self.ignorePES = kw.pop("ignorePES", False)
         self.hideAdaptation = kw.pop("hideAdaptation", False)
         self.ignorePMT = kw.pop("ignorePMT", False)
+        self.ignorePSI = kw.pop("ignorePSI")
         self.ignorePAT = kw.pop("ignorePAT", False)
         self.ignoreLeft = kw.pop("ignoreLeft", False)
         self.log = deque()
@@ -142,7 +143,7 @@ class Stream():
                     self.inf(GFMT % "First time we receive this PID")
                 else:
                     self.inf(RFMT % ("Counter discontinuity, from %d to %d" %
-                            (last, counter)))
+                             (last, counter)))
             lastCounter[pid] = counter
             if onlyPusi and not pusi:
                 self.cShow = False
@@ -225,6 +226,9 @@ class Stream():
             elif first | TEI_MASK == MIP_MASK:
                 raise NotImplementedError("DVB-MIP")
             else:
+                if self.ignorePSI:
+                    self.cShow = False
+                    return
                 self.parse_PSI(data, n + 1)
 
     def parse_PES(self, data, n=0):
@@ -288,6 +292,8 @@ class Stream():
                     header.read(bytes, fieldLength)
             if header:
                 self.inf(S * n + check(header))
+        if data and not self.ignoreLeft:
+            self.inf(S * n + str(data.read(bytes, len(data) // 8)))
 
     def parse_PSI(self, data, n=0):
         data.read(bytes, data.read(uint8))
@@ -372,7 +378,7 @@ class Stream():
                 lastTableId = tableData.read(uint8)
                 self.inf(S * (n + 1) + "EIT[%d][%d] %d/ %d" %
                          (tsId, networkId, segment, lastTableId))
-                if tableData:
+                while tableData:
                     eventId = read_uint(tableData, 16)
                     mjd = mjd2date(read_uint(tableData, 16))
                     bcd = bcd2hour(read_uint(tableData, 24))
@@ -385,7 +391,7 @@ class Stream():
                     self.inf(S * (n + 1) + "EVENT[%d](%d) %s %d|%d" %
                              (eventId, length, timeStr, status, freeCA))
                     if length > len(tableData) // 8:
-                        pass  # TODO: else complete
+                        break  # TODO: else complete
                     elif length:
                         descriptors = tableData.read(BitStream, length * 8)
                         self.inf(S * (n + 1) +
@@ -429,5 +435,6 @@ def main(path, **kw):
 if __name__ == "__main__":
     path = ("/home/huxley/Desktop/20180727-145000"
             "-20180727-145500-RGE1_CAT2_REC.ts")
-    main(path, onlyPusi=True, ignorePES=True, hideAdaptation=True,
-         ignorePMT=True, ignorePAT=True, ignoreLeft=False, ignorePids=(21,))
+    main(path, onlyPusi=True, ignorePES=False, ignorePSI=True,
+         hideAdaptation=True, ignorePMT=True, ignorePAT=True,
+         ignoreLeft=False, ignorePids=(21,))
