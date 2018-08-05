@@ -3,6 +3,7 @@ from bitstream import BitStream
 from numpy import int8, uint8
 from crcmod import predefined
 from pprint import pprint
+from collections import deque
 
 TSC_OPTION = ["Not scrambled", "Reserved for future use",
               "Scrambled with even key", "Scrambled with odd key"]
@@ -14,7 +15,6 @@ PACKET_SIZE = 184 * 8  # In bits
 PES_WITH_EXTENSION = set([0xBD])
 PES_WITH_EXTENSION.update(range(0xC0, 0xDF + 1))
 PES_WITH_EXTENSION.update(range(0xE0, 0xEF + 1))
-
 PES_MASK = 0b000000000000000000000001
 MIP_MASK = 0b010001111110000000001111
 TEI_MASK = 0b000000001000000000000000
@@ -59,15 +59,32 @@ def read_based_timestamp(stream):
     return base * 300 + extension
 
 
+def check(stream):
+    length = len(stream)
+    stuffing = stream.read(bool, length)
+    if all(stuffing):
+        return "**%d Stuffing Bytes" % (length // 8)
+    else:
+        raise Exception("Bits left in stream:\n%s" %
+                        "".join("01"[i] for i in stuffing))
+
+
 class Stream():
-    def __init__(self, raw, ignorePids, onlyPusi):
+    def __init__(self, raw, ignorePids, **kw):
         self.raw = raw
         self.ignorePids = ignorePids
-        self.onlyPusi = onlyPusi
+        self.onlyPusi = kw.pop("onlyPusi", False)
+        self.ignorePES = kw.pop("ignorePES", False)
+        self.hideAdaptation = kw.pop("hideAdaptation", False)
+        self.log = deque()
+
+    def inf(self, s):
+        self.log.append(s)
 
     def parse(self):
         self.pat = {}
         self.pes = {}
+        self.cShow = False
         pat = self.pat
         data = BitStream(self.raw)
         ignorePids = self.ignorePids
@@ -75,6 +92,12 @@ class Stream():
         total = len(data)
         lastCounter = {}
         while data:
+            if self.cShow:
+                try:
+                    print("\n".join(self.log))
+                except TypeError:
+                    print("\n".join(map(str, self.log)))
+            self.log.clear()
             sync = data.read(uint8)
             if sync != 0x47:
                 raise Exception("Sync should be 0x47, it is 0x%x" % sync)
@@ -82,60 +105,60 @@ class Stream():
             pid = read_uint(data, 13)
             if pid in ignorePids:
                 data.read(bytes, 185)
+                self.cShow = False
                 continue
             tsc = TSC_OPTION[read_uint(data, 2)]
             adaptationF, payloadF = data.read(bool, 2)
             counter = read_uint(data, 4)
             left = data.read(BitStream, PACKET_SIZE)
-            try:
-                if (lastCounter[pid] + 1) % 16 != counter:
-                    text = ("Counter discontinuity, from %d to %d" %
-                            (lastCounter[pid], counter))
-                    print(RFMT % text)
-            except KeyError:
-                pass
+            last = lastCounter.pop(pid, -1)
+            if (last + 1) % 16 != counter and last != -1:
+                self.inf(RFMT % ("Counter discontinuity, from %d to %d" %
+                         (last, counter)))
             lastCounter[pid] = counter
             if onlyPusi and not pusi:
+                self.cShow = False
                 continue
-            print(PFMT % (pid, counter, tei, pusi, priority,
-                  adaptationF, payloadF, 100 - len(data) * 100 / total, tsc))
+            self.inf(PFMT % (pid, counter, tei, pusi, priority, adaptationF,
+                     payloadF, 100 - len(data) * 100 / total, tsc))
             if tei:
-                print(RFMT % "Transport Error Indicator (TEI)")
+                self.inf(RFMT % "Transport Error Indicator (TEI)")
             self.cPid = pid
             self.cPusi = pusi
-            self.cAdaptationF = adaptationF
-            self.cPayloadF = payloadF
+            self.cShow = True
+            self.cIncomplete = False
             try:
                 self.cProgram = pat[pid]
             except KeyError:
                 self.cProgram = -1
-            self.parse_packet(left)
-
-    def parse_packet(self, data):
-        self.cIncomplete = False
-        if self.cAdaptationF:
-            length = data.read(uint8)
-            if length:
-                self.parse_adaptation(data.read(BitStream, length * 8), 1)
-        if self.cPayloadF:
-            if data:
-                self.parse_payload(data, 1)
-        if self.cIncomplete:
-            print(S + RFMT % "Incomplete payload")
+            if adaptationF:
+                length = left.read(uint8)
+                if length:
+                    if self.hideAdaptation:
+                        left.read(bytes, length)
+                    else:
+                        self.parse_adaptation(left.read(BitStream,
+                                                        length * 8), 1)
+            if payloadF:
+                if left:
+                    self.parse_payload(left, 1)
+            if self.cIncomplete:
+                self.inf(S + RFMT % "Incomplete payload")
 
     def parse_adaptation(self, data, n=0):
         (discontinuity, rai, streamPriority, pcrF, opcrF, spliceF,
          privateF, extensionF) = data.read(bool, 8)
-        print(S * n + "ADAPTATION (%d)" % (len(data) // 8 + 1))
-        print(S * n + "FLAGS: %d|%d|%d|%d|%d|%d|%d|%d" % (discontinuity, rai,
-              streamPriority, pcrF, opcrF, spliceF, privateF, extensionF))
+        self.inf(S * n + "ADAPTATION (%d)" % (len(data) // 8 + 1))
+        self.inf(S * n + "FLAGS: %d|%d|%d|%d|%d|%d|%d|%d" %
+                 (discontinuity, rai, streamPriority, pcrF, opcrF, spliceF,
+                  privateF, extensionF))
         pcr = opcr = 0
         if pcrF:
             pcr = read_based_timestamp(data)
-            print(S + "PCR -> %d" % pcr)
+            self.inf(S + "PCR -> %d" % pcr)
             if opcrF:
                 opcr = read_based_timestamp(data)
-                print(S * n + "OPCR -> %d" % opcr)
+                self.inf(S * n + "OPCR -> %d" % opcr)
         if spliceF:
             splice = data.read(int8)
         if privateF:
@@ -145,8 +168,8 @@ class Stream():
             length = data.read(uint8)
             extension = data.read(BitStream, length * 8)
             ltwF, pieceWiseF, seamlessF = extension.read(bool, 3)
-            print(S * n + "EXTENSION (%d) %d|%d|%d" %
-                  (length, ltwF, pieceWiseF, seamlessF))
+            self.inf(S * n + "EXTENSION (%d) %d|%d|%d" %
+                     (length, ltwF, pieceWiseF, seamlessF))
             extension.read(bool, 5)
             if ltwF:
                 valid = extension.read(bool, 1)
@@ -158,21 +181,18 @@ class Stream():
                 spliceType = read_uint(extension, 4)
                 nextDts = read_timestamp(extension)
             if extension:
-                raise Exception("Bits left in extension: %s" % extension)
+                raise Exception("Bits left in extension:\n%s" % extension)
         if data:
-            length = len(data)
-            stuffing = data.read(bool, length)
-            if all(stuffing):
-                print(S + "**%d Stuffing Bytes" % (length // 8))
-            else:
-                raise Exception("Bits left in adaptation: %s" %
-                                "".join("01"[i] for i in stuffing))
+            self.inf(S * n + check(data))
 
     def parse_payload(self, data, n=0):
-        print(S * n + "PAYLOAD (%03d)" % (len(data) // 8))
+        self.inf(S * n + "PAYLOAD (%03d)" % (len(data) // 8))
         if self.cPusi:
             first = read_uint(data.copy(24), 24)
             if first == PES_MASK:
+                if self.ignorePES:
+                    self.cShow = False
+                    return
                 self.parse_PES(data, n + 1)
             elif first | TEI_MASK == MIP_MASK:
                 raise NotImplementedError("DVB-MIP")
@@ -184,29 +204,31 @@ class Stream():
         streamId = data.read(uint8)
         pesLength = read_uint(data, 16)
         hasExtension = streamId in PES_WITH_EXTENSION
-        print(S * n + "PES[%03d](%d)>%d" % (streamId, pesLength, hasExtension))
+        self.inf(S * n + "PES[%03d](%d)>%d" %
+                 (streamId, pesLength, hasExtension))
         if hasExtension:
             data.read(bool, 2)
             scrambling = read_uint(data, 2)
             (priority, alignment, copyrighted, original, ptsF, dtsF, escrF,
              esRateF, dsmTrickF, copyF, crcF, extensionF) = data.read(bool, 12)
             length = data.read(uint8)
-            print(S * n + "HEADER(%d) %d|%d|%d|%d %d|%d|%d|%d|%d|%d|%d|%d" %
-                  (length, priority, alignment, copyrighted, original, ptsF,
-                   dtsF, escrF, esRateF, dsmTrickF, copyF, crcF, extensionF))
+            args = (length, priority, alignment, copyrighted, original, ptsF,
+                    dtsF, escrF, esRateF, dsmTrickF, copyF, crcF, extensionF)
+            self.inf(S * n + "HEADER(%d) %d|%d|%d|%d "
+                     "%d|%d|%d|%d|%d|%d|%d|%d" % args)
             header = data.read(BitStream, length * 8)
             if ptsF:
                 header.read(bool, 4)
                 pts = read_timestamp(header)
-                print(S * n + "PTS -> %d" % pts)
+                self.inf(S * n + "PTS -> %d" % pts)
                 if dtsF:
                     header.read(bool, 4)
                     dts = read_timestamp(header)
-                    print(S * n + "DTS -> %d" % dts)
+                    self.inf(S * n + "DTS -> %d" % dts)
             if escrF:
                 header.read(bool, 2)
                 escr = read_based_timestamp(header)
-                print(S * n + "ESCR -> %d" % escr)
+                self.inf(S * n + "ESCR -> %d" % escr)
             if esRateF:
                 header.read(bool)
                 rate = read_uint(header, 22)
@@ -235,7 +257,9 @@ class Stream():
                 if extension2F:
                     header.read(bool)
                     fieldLength = read_uint(header, 7)
-                    header.read(bytes)
+                    header.read(bytes, fieldLength)
+            if header:
+                self.inf(S * n + check(header))
 
     def parse_PSI(self, data, n=0):
         data.read(bytes, data.read(uint8))
@@ -244,8 +268,8 @@ class Stream():
         syntaxF, privateBitF = data.read(bool, 2)
         data.read(bool, 2)
         length = read_uint(data, 12)
-        print(S * n + "PSI[%03d](%d) %d|%d" %
-              (tableId, length, syntaxF, privateBitF))
+        self.inf(S * n + "PSI[%03d](%d) %d|%d" %
+                 (tableId, length, syntaxF, privateBitF))
         if length > len(data) // 8:
             length = len(data) // 8
             self.cIncomplete = True
@@ -258,21 +282,21 @@ class Stream():
             currentF = syntax.read(bool)
             section, last = syntax.read(uint8, 2)
             tableData = syntax.read(BitStream, len(syntax) - 32)
-            print(S * n + "Syntax[%03d](%d) v%d |%d| %d/%d" %
-                  (tableIdExtension, len(tableData) // 8, version,
-                   currentF, section, last))
+            self.inf(S * n + "Syntax[%03d](%d) v%d |%d| %d/%d" %
+                     (tableIdExtension, len(tableData) // 8, version,
+                      currentF, section, last))
             originalCrc = read_uint(syntax, 32)
             myCrc = crc32(copy.read(bytes, len(copy) // 8))
             if originalCrc != myCrc:
                 text = ("CRC does not match (0x%x vs 0x%x)" %
                         (originalCrc, myCrc))
-                print(S * n + RFMT % text)
+                self.inf(S * n + RFMT % text)
             if not (self.cPid or tableId or privateBitF):  # PAT
                 while tableData:
                     programNum = read_uint(tableData, 16)
                     tableData.read(bool, 3)
                     programPid = read_uint(tableData, 13)
-                    print(S * n + "PAT %d - %d" % (programNum, programPid))
+                    self.inf(S * n + "PAT %d - %d" % (programNum, programPid))
                     if currentF:
                         self.pat[programPid] = programNum
             elif self.cProgram >= 0 and not privateBitF:  # PMT
@@ -281,69 +305,65 @@ class Stream():
                 tableData.read(bool, 4)
                 length = read_uint(tableData, 12)
                 programDescriptors = tableData.read(BitStream, length * 8)
-                print(read_descriptors(programDescriptors))
-                print(S * n + str(programDescriptors))
+                self.inf(read_descriptors(programDescriptors))
+                self.inf(S * n + str(programDescriptors))
                 while tableData:
                     streamType = tableData.read(uint8)
                     tableData.read(bool, 3)
                     elementatyPid = read_uint(tableData, 13)
                     tableData.read(bool, 4)
                     _length = read_uint(tableData, 12)
-                    print(S * (n + 1) + "PMT[%d][%d](%d)(%d) PCR -> %d" %
-                          (elementatyPid, streamType, length, _length, pcrPid))
+                    self.inf(S * (n + 1) + "PMT[%d][%d](%d)(%d) PCR -> %d" %
+                             (elementatyPid, streamType, length,
+                              _length, pcrPid))
                     streamDescriptors = tableData.read(BitStream, _length * 8)
-                    print(read_descriptors(streamDescriptors))
-                    print(S * n + str(streamDescriptors))
+                    self.inf(read_descriptors(streamDescriptors))
+                    self.inf(S * n + str(streamDescriptors))
             elif self.cPid == 17 and tableId == 66:  # SDT
                 networkId = read_uint(tableData, 16)
                 tableData.read(bytes, 1)
-                print(S * (n + 1) + "SDT[%d]" % networkId)
+                self.inf(S * (n + 1) + "SDT[%d]" % networkId)
                 if tableData:
-                    print(S * (n + 1) +
-                          str(tableData.read(bytes, len(tableData) // 8)))
+                    self.inf(S * (n + 1) +
+                             str(tableData.read(bytes, len(tableData) // 8)))
             elif self.cPid == 18:  # EIT
                 tsId = read_uint(tableData, 16)
                 networkId = read_uint(tableData, 16)
                 segment = tableData.read(uint8)
                 lastTableId = tableData.read(uint8)
-                print(S * (n + 1) + "EIT[%d][%d] %d/ %d" %
-                      (tsId, networkId, segment, lastTableId))
+                self.inf(S * (n + 1) + "EIT[%d][%d] %d/ %d" %
+                         (tsId, networkId, segment, lastTableId))
                 if tableData:
-                    print(S * (n + 1) +
-                          str(tableData.read(bytes, len(tableData) // 8)))
+                    self.inf(S * (n + 1) +
+                             str(tableData.read(bytes, len(tableData) // 8)))
             else:
-                print(S * n + RFMT % "Not registered")
+                self.inf(S * n + RFMT % "Not registered")
             if tableData:
-                print(S * n + str(tableData))
+                self.inf(S * n + str(tableData))
         if data:
-            length = len(data)
-            stuffing = data.read(bool, length)
-            if all(stuffing):
-                print(S * n + "**%d Stuffing Bytes" % (length // 8))
-            else:
-                return  # Only for debug purposes
-                raise Exception("Bits left in PSI: %s" %
-                                "".join("01"[i] for i in stuffing))
+            return  # Only for debug purposes
+            self.inf(S * n + check(data))
 
 
-def main(path, targetPids=None, ignorePids=tuple(), onlyPusi=False):
+def main(path, **kw):
     with open(path, "rb") as f:
         raw = f.read()
-    if targetPids:
-        ignorePids = set(range(1 << 13)) - set(targetPids)
+    if "targetPids" in kw:
+        ignorePids = set(range(1 << 13)) - set(kw.pop("targetPids"))
     else:
-        ignorePids = set(ignorePids)
-    stream = Stream(raw, ignorePids, onlyPusi)
+        ignorePids = set(kw.pop("ignorePids", tuple()))
+    stream = Stream(raw, ignorePids, **kw)
     try:
         stream.parse()
     except KeyboardInterrupt:
         print(RFMT % "Keyboard interrupt")
     pprint(stream.pat)
     pprint(stream.pes)
+    print("\n".join(stream.log))
     print(RFMT % "END OF FILE")
     while True:
         try:
-            input("\rPress any key to exit")
+            input("\rPress enter to exit")
         except KeyboardInterrupt:
             pass
         else:
@@ -353,4 +373,4 @@ def main(path, targetPids=None, ignorePids=tuple(), onlyPusi=False):
 if __name__ == "__main__":
     path = ("/home/huxley/Desktop/20180727-145000"
             "-20180727-145500-RGE1_CAT2_REC.ts")
-    main(path, onlyPusi=True)
+    main(path, onlyPusi=True, ignorePES=True, hideAdaptation=True)
