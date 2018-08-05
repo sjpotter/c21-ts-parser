@@ -2,6 +2,7 @@
 from bitstream import BitStream
 from numpy import int8, uint8
 from crcmod import predefined
+from pprint import pprint
 
 TSC_OPTION = ["Not scrambled", "Reserved for future use",
               "Scrambled with even key", "Scrambled with odd key"]
@@ -91,7 +92,7 @@ class Stream():
                     text = ("Counter discontinuity, from %d to %d" %
                             (lastCounter[pid], counter))
                     print(RFMT % text)
-            except:
+            except KeyError:
                 pass
             lastCounter[pid] = counter
             if onlyPusi and not pusi:
@@ -127,7 +128,7 @@ class Stream():
          privateF, extensionF) = data.read(bool, 8)
         print(S * n + "ADAPTATION (%d)" % (len(data) // 8 + 1))
         print(S * n + "FLAGS: %d|%d|%d|%d|%d|%d|%d|%d" % (discontinuity, rai,
-               streamPriority, pcrF, opcrF, spliceF, privateF, extensionF))
+              streamPriority, pcrF, opcrF, spliceF, privateF, extensionF))
         pcr = opcr = 0
         if pcrF:
             pcr = read_based_timestamp(data)
@@ -183,7 +184,7 @@ class Stream():
         streamId = data.read(uint8)
         pesLength = read_uint(data, 16)
         hasExtension = streamId in PES_WITH_EXTENSION
-        print(S * n + "PES[%03d](%d) |%d|" % (streamId, pesLength, hasExtension))
+        print(S * n + "PES[%03d](%d)>%d" % (streamId, pesLength, hasExtension))
         if hasExtension:
             data.read(bool, 2)
             scrambling = read_uint(data, 2)
@@ -219,7 +220,7 @@ class Stream():
                 crc = read_uint(header, 16)
             if extensionF:
                 (privateF, fieldF, counterF,
-                 pstdF, _. _. _, extension2F) = header.read(bool, 8)
+                 pstdF, _, _, _, extension2F) = header.read(bool, 8)
                 if privateF:
                     private = header.read(bytes, 16)
                 if fieldF:
@@ -235,7 +236,6 @@ class Stream():
                     header.read(bool)
                     fieldLength = read_uint(header, 7)
                     header.read(bytes)
-
 
     def parse_PSI(self, data, n=0):
         data.read(bytes, data.read(uint8))
@@ -334,8 +334,20 @@ def main(path, targetPids=None, ignorePids=tuple(), onlyPusi=False):
     else:
         ignorePids = set(ignorePids)
     stream = Stream(raw, ignorePids, onlyPusi)
-    stream.parse()
+    try:
+        stream.parse()
+    except KeyboardInterrupt:
+        print(RFMT % "Keyboard interrupt")
+    pprint(stream.pat)
+    pprint(stream.pes)
     print(RFMT % "END OF FILE")
+    while True:
+        try:
+            input("\rPress any key to exit")
+        except KeyboardInterrupt:
+            pass
+        else:
+            break
 
 
 if __name__ == "__main__":
