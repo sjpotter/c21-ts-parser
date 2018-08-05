@@ -23,23 +23,77 @@ def read_uint(stream, n):
     return sum(i << a for a, i in enumerate(stream.read(bool, n)[::-1]))
 
 
+def read_descriptor(stream):
+    tag = stream.read(uint8)
+    length = stream.read(uint8)
+    data = stream.read(bytes, length)
+    return tag, data
+
+
+def read_descriptors(stream):
+    out = []
+    while stream:
+        out.append(read_descriptor(stream))
+    return out
+
+
 def tprint(n, s, width=3):
     print(" " * n * width + s)
 
 
 class Stream():
-    def __init__(self):
-        self.pat = {}
+    def __init__(self, raw, ignorePids, onlyPusi):
+        self.raw = raw
+        self.ignorePids = ignorePids
+        self.onlyPusi = onlyPusi
 
-    def parse_packet(self, data, pid, pusi, adaptationF, payloadF):
-        self.cPid = pid
-        self.cPusi = pusi
+    def parse(self):
+        self.pat = {}
+        data = BitStream(self.raw)
+        ignorePids = self.ignorePids
+        onlyPusi = self.onlyPusi
+        total = len(data)
+        lastCounter = {}
+        while data:
+            sync = data.read(uint8)
+            if sync != 0x47:
+                raise Exception("Sync should be 0x47, it is 0x%x" % sync)
+            tei, pusi, priority = data.read(bool, 3)
+            pid = read_uint(data, 13)
+            if pid in ignorePids:
+                data.read(bytes, 185)
+                continue
+            tsc = TSC_OPTION[read_uint(data, 2)]
+            adaptationF, payloadF = data.read(bool, 2)
+            counter = read_uint(data, 4)
+            left = data.read(BitStream, PACKET_SIZE)
+            try:
+                if (lastCounter[pid] + 1) % 16 != counter:
+                    text = ("Counter discontinuity, from %d to %d" %
+                            (lastCounter[pid], counter))
+                    print(RFMT % text)
+            except:
+                pass
+            lastCounter[pid] = counter
+            if onlyPusi and not pusi:
+                continue
+            print(PFMT % (pid, counter, tei, pusi, priority,
+                  adaptationF, payloadF, 100 - len(data) * 100 / total, tsc))
+            if tei:
+                print(RFMT % "Transport Error Indicator (TEI)")
+            self.cPid = pid
+            self.cPusi = pusi
+            self.cAdaptationF = adaptationF
+            self.cPayloadF = payloadF
+            self.parse_packet(left)
+
+    def parse_packet(self, data):
         self.cIncomplete = False
-        if adaptationF:
+        if self.cAdaptationF:
             length = data.read(uint8)
             if length:
                 self.parse_adaptation(data.read(BitStream, length * 8), 1)
-        if payloadF:
+        if self.cPayloadF:
             if data:
                 self.parse_payload(data, 1)
         if self.cIncomplete:
@@ -149,8 +203,7 @@ class Stream():
                 text = ("CRC does not match (0x%x vs 0x%x)" %
                         (originalCrc, myCrc))
                 tprint(n, RFMT % text)
-                return
-            if not (self.cPid or tableId or privateBitF):
+            if not (self.cPid or tableId or privateBitF):  # PAT
                 while tableData:
                     programNum = read_uint(tableData, 16)
                     tableData.read(bool, 3)
@@ -158,14 +211,13 @@ class Stream():
                     tprint(n + 1, "PAT %d - %d" % (programNum, programPid))
                     if currentF:
                         self.pat[programPid] = programNum
-            elif self.cPid in self.pat and not privateBitF:
+            elif self.cPid in self.pat and not privateBitF:  # PMT
                 tableData.read(bool, 3)
                 pcrPid = read_uint(tableData, 13)
                 tableData.read(bool, 4)
                 length = read_uint(tableData, 12)
-                programDescriptors = tableData.read(bytes, length)
-                # TODO: Parse descriptors
-                # https://en.wikipedia.org/wiki/Program-specific_information#Descriptor
+                programDescriptors = tableData.read(BitStream, length * 8)
+                print(read_descriptors(programDescriptors))
                 tprint(n + 1, str(programDescriptors))
                 while tableData:
                     streamType = tableData.read(uint8)
@@ -175,11 +227,28 @@ class Stream():
                     _length = read_uint(tableData, 12)
                     print(S * (n + 1) + "PMT[%d][%d](%d)(%d) PCR -> %d" %
                           (elementatyPid, streamType, length, _length, pcrPid))
-                    streamDescriptors = tableData.read(bytes, _length)
-                    # TODO: Parse descriptors
+                    streamDescriptors = tableData.read(BitStream, _length * 8)
+                    print(read_descriptors(streamDescriptors))
                     tprint(n + 1, str(streamDescriptors))
+            elif self.cPid == 17 and tableId == 66:  # SDT
+                networkId = read_uint(tableData, 16)
+                tableData.read(bytes, 1)
+                print(S * (n + 1) + "SDT[%d]" % networkId)
+                if tableData:
+                    print(S * (n + 1) +
+                          str(tableData.read(bytes, len(tableData) // 8)))
+            elif self.cPid == 18:  # EIT
+                tsId = read_uint(tableData, 16)
+                networkId = read_uint(tableData, 16)
+                segment = tableData.read(uint8)
+                lastTableId = tableData.read(uint8)
+                print(S * (n + 1) + "EIT[%d][%d] %d/ %d" %
+                      (tsId, networkId, segment, lastTableId))
+                if tableData:
+                    print(S * (n + 1) +
+                          str(tableData.read(bytes, len(tableData) // 8)))
             else:
-                tprint(n + 1, RFMT % "Neither PAT or PMT")
+                tprint(n + 1, RFMT % "Not registered")
             if tableData:
                 tprint(n, str(tableData))
         if data:
@@ -194,48 +263,18 @@ class Stream():
 
 
 def main(path, targetPids=None, ignorePids=tuple(), onlyPusi=False):
-    stream = Stream()
     with open(path, "rb") as f:
         raw = f.read()
-    data = BitStream(raw)
-    total = len(data)
-    lastCounter = {}
     if targetPids:
         ignorePids = set(range(1 << 13)) - set(targetPids)
     else:
         ignorePids = set(ignorePids)
-    while data:
-        sync = data.read(uint8)
-        if sync != 0x47:
-            raise Exception("Sync should be 0x47, it is 0x%x" % sync)
-        tei, pusi, priority = data.read(bool, 3)
-        pid = read_uint(data, 13)
-        if pid in ignorePids:
-            data.read(bytes, 186)
-            continue
-        tsc = TSC_OPTION[read_uint(data, 2)]
-        adaptationF, payloadF = data.read(bool, 2)
-        counter = read_uint(data, 4)
-        left = data.read(BitStream, PACKET_SIZE)
-        try:
-            if (lastCounter[pid] + 1) % 16 != counter:
-                text = ("Counter discontinuity, from %d to %d" %
-                        (lastCounter[pid], counter))
-                print(RFMT % text)
-        except:
-            pass
-        lastCounter[pid] = counter
-        if onlyPusi and not pusi:
-            continue
-        print(PFMT % (pid, counter, tei, pusi, priority,
-              adaptationF, payloadF, 100 - len(data) * 100 / total, tsc))
-        if tei:
-            print(RFMT % "Transport Error Indicator (TEI)")
-        stream.parse_packet(left, pid, pusi, adaptationF, payloadF)
+    stream = Stream(raw, ignorePids, onlyPusi)
+    stream.parse()
     print(RFMT % "END OF FILE")
 
 
 if __name__ == "__main__":
     path = ("/home/huxley/Desktop/20180727-145000"
             "-20180727-145500-RGE1_CAT2_REC.ts")
-    main(path, onlyPusi=True)
+    main(path, onlyPusi=True, targetPids=range(2, 18))
