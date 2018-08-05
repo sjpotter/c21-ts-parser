@@ -10,17 +10,38 @@ TSC_OPTION = ["Not scrambled", "Reserved for future use",
 PFMT = ("\033[0;44m[%04d]\033[42m(%02d)\033[0m %d|%d|%d %d|%d "
         "<\033[1;92m%.3f%%\033[0m> %s")
 RFMT = "\033[1;31m%s\033[0m"
+GFMT = "\033[1;32m%s\033[0m"
 S = " " * 3
 PACKET_SIZE = 184 * 8  # In bits
 PES_WITH_EXTENSION = set([0xBD])
 PES_WITH_EXTENSION.update(range(0xC0, 0xDF + 1))
 PES_WITH_EXTENSION.update(range(0xE0, 0xEF + 1))
+EIT_ACTUAL = set([0x4E])
+EIT_ACTUAL.update(range(0x50, 0x5F + 1))
 PES_MASK = 0b000000000000000000000001
 MIP_MASK = 0b010001111110000000001111
 TEI_MASK = 0b000000001000000000000000
 
 
 crc32 = predefined.mkCrcFun("crc-32-mpeg")
+
+
+def mjd2date(mjd):
+    # TODO: Fix it
+    yearDelay = mjd - 15078.2
+    year = int(yearDelay / 365.25)
+    monthDelay = mjd - 14956.1 - int(yearDelay)
+    month = int(monthDelay / 30.6001)
+    day = int(mjd - 14956 - int(yearDelay) - int(monthDelay))
+    k = (month == 14 or month == 15)
+    year += k
+    month -= 1 + k * 12
+    return (year, month, day)
+
+
+def bcd2hour(bcd):
+    s = hex(bcd)[2:].rjust(6, "0")
+    return [int(i) for i in (s[:2], s[2:4], s[4:])]
 
 
 def read_uint(stream, n):
@@ -76,6 +97,9 @@ class Stream():
         self.onlyPusi = kw.pop("onlyPusi", False)
         self.ignorePES = kw.pop("ignorePES", False)
         self.hideAdaptation = kw.pop("hideAdaptation", False)
+        self.ignorePMT = kw.pop("ignorePMT", False)
+        self.ignorePAT = kw.pop("ignorePAT", False)
+        self.ignoreLeft = kw.pop("ignoreLeft", False)
         self.log = deque()
 
     def inf(self, s):
@@ -84,6 +108,7 @@ class Stream():
     def parse(self):
         self.pat = {}
         self.pes = {}
+        self.pcr = {}
         self.cShow = False
         pat = self.pat
         data = BitStream(self.raw)
@@ -112,9 +137,12 @@ class Stream():
             counter = read_uint(data, 4)
             left = data.read(BitStream, PACKET_SIZE)
             last = lastCounter.pop(pid, -1)
-            if (last + 1) % 16 != counter and last != -1:
-                self.inf(RFMT % ("Counter discontinuity, from %d to %d" %
-                         (last, counter)))
+            if (last + 1) % 16 != counter:
+                if last == -1:
+                    self.inf(GFMT % "First time we receive this PID")
+                else:
+                    self.inf(RFMT % ("Counter discontinuity, from %d to %d" %
+                            (last, counter)))
             lastCounter[pid] = counter
             if onlyPusi and not pusi:
                 self.cShow = False
@@ -292,6 +320,9 @@ class Stream():
                         (originalCrc, myCrc))
                 self.inf(S * n + RFMT % text)
             if not (self.cPid or tableId or privateBitF):  # PAT
+                if self.ignorePAT:
+                    self.cShow = False
+                    return
                 while tableData:
                     programNum = read_uint(tableData, 16)
                     tableData.read(bool, 3)
@@ -300,13 +331,16 @@ class Stream():
                     if currentF:
                         self.pat[programPid] = programNum
             elif self.cProgram >= 0 and not privateBitF:  # PMT
+                if self.ignorePMT:
+                    self.cShow = False
+                    return
                 tableData.read(bool, 3)
                 pcrPid = read_uint(tableData, 13)
                 tableData.read(bool, 4)
                 length = read_uint(tableData, 12)
-                programDescriptors = tableData.read(BitStream, length * 8)
-                self.inf(read_descriptors(programDescriptors))
-                self.inf(S * n + str(programDescriptors))
+                if length:
+                    programDescriptors = tableData.read(BitStream, length * 8)
+                    self.inf(S * n + str(read_descriptors(programDescriptors)))
                 while tableData:
                     streamType = tableData.read(uint8)
                     tableData.read(bool, 3)
@@ -316,17 +350,22 @@ class Stream():
                     self.inf(S * (n + 1) + "PMT[%d][%d](%d)(%d) PCR -> %d" %
                              (elementatyPid, streamType, length,
                               _length, pcrPid))
-                    streamDescriptors = tableData.read(BitStream, _length * 8)
-                    self.inf(read_descriptors(streamDescriptors))
-                    self.inf(S * n + str(streamDescriptors))
+                    if currentF:
+                        self.pcr[elementatyPid] = pcrPid
+                    if _length:
+                        streamDescriptors = tableData.read(BitStream,
+                                                           _length * 8)
+                        self.inf(S * (n + 1) +
+                                 str(read_descriptors(streamDescriptors)))
             elif self.cPid == 17 and tableId == 66:  # SDT
                 networkId = read_uint(tableData, 16)
                 tableData.read(bytes, 1)
                 self.inf(S * (n + 1) + "SDT[%d]" % networkId)
-                if tableData:
-                    self.inf(S * (n + 1) +
-                             str(tableData.read(bytes, len(tableData) // 8)))
+                # TODO: PARSE IT
             elif self.cPid == 18:  # EIT
+                if tableId not in EIT_ACTUAL:
+                    self.inf(S * (n + 1) + "EIT from another TS, discarded")
+                    return
                 tsId = read_uint(tableData, 16)
                 networkId = read_uint(tableData, 16)
                 segment = tableData.read(uint8)
@@ -334,14 +373,29 @@ class Stream():
                 self.inf(S * (n + 1) + "EIT[%d][%d] %d/ %d" %
                          (tsId, networkId, segment, lastTableId))
                 if tableData:
-                    self.inf(S * (n + 1) +
-                             str(tableData.read(bytes, len(tableData) // 8)))
+                    eventId = read_uint(tableData, 16)
+                    mjd = mjd2date(read_uint(tableData, 16))
+                    bcd = bcd2hour(read_uint(tableData, 24))
+                    duration = bcd2hour(read_uint(tableData, 24))
+                    status = read_uint(tableData, 3)
+                    freeCA = tableData.read(bool)
+                    length = read_uint(tableData, 12)
+                    timeStr = ("%d/%d/%d - %d:%d:%d for %d:%d:%d" %
+                               (*mjd, *bcd, *duration))
+                    self.inf(S * (n + 1) + "EVENT[%d](%d) %s %d|%d" %
+                             (eventId, length, timeStr, status, freeCA))
+                    if length > len(tableData) // 8:
+                        pass  # TODO: else complete
+                    elif length:
+                        descriptors = tableData.read(BitStream, length * 8)
+                        self.inf(S * (n + 1) +
+                                 str(read_descriptors(descriptors)))
             else:
                 self.inf(S * n + RFMT % "Not registered")
-            if tableData:
-                self.inf(S * n + str(tableData))
+            if tableData and not self.ignoreLeft:
+                self.inf(S * n +
+                         str(tableData.read(bytes, len(tableData) // 8)))
         if data:
-            return  # Only for debug purposes
             self.inf(S * n + check(data))
 
 
@@ -357,6 +411,8 @@ def main(path, **kw):
         stream.parse()
     except KeyboardInterrupt:
         print(RFMT % "Keyboard interrupt")
+    except Exception as e:
+        print(RFMT % str(e))
     pprint(stream.pat)
     pprint(stream.pes)
     print("\n".join(stream.log))
@@ -373,4 +429,5 @@ def main(path, **kw):
 if __name__ == "__main__":
     path = ("/home/huxley/Desktop/20180727-145000"
             "-20180727-145500-RGE1_CAT2_REC.ts")
-    main(path, onlyPusi=True, ignorePES=True, hideAdaptation=True)
+    main(path, onlyPusi=True, ignorePES=True, hideAdaptation=True,
+         ignorePMT=True, ignorePAT=True, ignoreLeft=False, ignorePids=(21,))
