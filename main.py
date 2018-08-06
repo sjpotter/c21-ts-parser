@@ -3,13 +3,15 @@ from bitstream import BitStream
 from numpy import int8, uint8
 from crcmod import predefined
 from pprint import pprint
+from os.path import getsize
 from collections import deque
+from itertools import count
+from struct import pack
+import socket
 
-TSC_OPTION = ["Not scrambled", "Reserved for future use",
-              "Scrambled with even key", "Scrambled with odd key"]
-PFMT = ("\033[0;44m[%04d]\033[42m(%02d)\033[0m %d|%d|%d %d|%d "
-        "<\033[1;92m%.3f%%\033[0m> %s")
-RFMT = "\033[1;31m%s\033[0m"
+PFMT = ("\033[46m[%04d]\033[0m\033[36m(%02d)\033[0m %d|\033[36m%d\033[0m|%d "
+        "%d <\033[92m%.3f%%\033[0m>")
+RFMT = "\033[1m\033[91m%s\033[0m"
 GFMT = "\033[1;32m%s\033[0m"
 S = " " * 3
 PACKET_SIZE = 184 * 8  # In bits
@@ -21,9 +23,11 @@ EIT_ACTUAL.update(range(0x50, 0x5F + 1))
 PES_MASK = 0b000000000000000000000001
 MIP_MASK = 0b010001111110000000001111
 TEI_MASK = 0b000000001000000000000000
-
-
 crc32 = predefined.mkCrcFun("crc-32-mpeg")
+
+
+class CException(Exception):
+    pass
 
 
 def mjd2date(mjd):
@@ -46,6 +50,11 @@ def bcd2hour(bcd):
 
 def read_uint(stream, n):
     return sum(i << a for a, i in enumerate(stream.read(bool, n)[::-1]))
+
+
+def toBits(b):
+    return ((b & 0x80) >> 7, (b & 0x40) >> 6, (b & 0x20) >> 5, (b & 0x10) >> 4,
+            (b & 0x08) >> 3, (b & 0x04) >> 2, (b & 0x02) >> 1, b & 0x01)
 
 
 def read_descriptor(stream):
@@ -90,53 +99,118 @@ def check(stream):
                         "".join("01"[i] for i in stuffing))
 
 
+def parse_timestamp_2(b):
+    """0123456701234567012345670123456701234567 (5 bytes)
+       --***-***************-***************---"""
+    return (((b[0] & 0x38) << 30) + ((b[0] & 0x03) << 28) +
+            (b[1] << 20) +
+            ((b[2] & 0xF8) << 15) + ((b[2] & 0x03) << 13) +
+            (b[3] << 5) +
+            ((b[4] & 0xF8) >> 3))
+
+
+def parse_based_timestamp_2(b):
+    """6 bytes. ~5 bytes of base and ~2 of extension"""
+    base = parse_timestamp_2(b)
+    extension = ((b[4] & 0x03) << 7) + ((b[5] & 0xFE) >> 1)
+    return base * 300 + extension
+
+
+def read_file(path):
+    """Read from a ts file at path"""
+    def wrapper(n):
+        return f_read(n)
+    f = open(path, "rb")
+    f_read = f.read
+    return wrapper
+
+
+def read_udp(ip, port):
+    """Read from udp://ip:port"""
+    def wrapper(n):
+        return s_recv(n)
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    s.bind((ip, port))
+    request = pack("4sl", socket.inet_aton(ip), socket.INADDR_ANY)
+    s.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, request)
+    s_recv = s.recv
+    return wrapper
+
+
 class Stream():
-    def __init__(self, raw, ignorePids, **kw):
-        self.raw = raw
-        self.ignorePids = ignorePids
-        self.onlyPusi = kw.pop("onlyPusi", False)
-        self.ignorePES = kw.pop("ignorePES", False)
-        self.hideAdaptation = kw.pop("hideAdaptation", False)
-        self.ignorePMT = kw.pop("ignorePMT", False)
-        self.ignorePSI = kw.pop("ignorePSI")
-        self.ignorePAT = kw.pop("ignorePAT", False)
-        self.ignoreLeft = kw.pop("ignoreLeft", False)
+    def __init__(self, skipPids, **kw):
+        # Load the parameters
+        self.skipPids = skipPids
+        self.skipNotPusi = kw.pop("skipNotPusi", False)
+        self.skipPes = kw.pop("skipPes", False)
+        self.skipPsi = kw.pop("skipPsi", False)
+        self.ignoreAdaptation = kw.pop("ignoreAdaptation", False)
+        self.ignorePayload = kw.pop("ignorePayload", False)
+        self.hideLeft = kw.pop("hideLeft", False)
+        self.kw = kw
         self.log = deque()
 
     def inf(self, s):
         self.log.append(s)
 
     def parse(self):
+        """Enter a loop that parses the stream and prints the info"""
+        # Prepare the file / udp
+        kw = self.kw
+        if "path" in kw:
+            read = read_file(kw["file"])
+            fSize = getsize(kw["file"]) // 188
+        elif "ip" in kw and "port" in kw:
+            read = read_udp(kw["ip"], kw["port"])
+            fSize = float("inf")
+        else:
+            print(RFMT % "Not enough paramaters given")
+            print("Give either a file path or an ip and a port")
+            return
+        # Start the variables
         self.pat = {}
         self.pes = {}
-        self.pcr = {}
+        self.pmt = {}
         self.cShow = False
+        # Load the local ones
+        log = self.log
+        log_clear = log.clear
         pat = self.pat
-        data = BitStream(self.raw)
-        ignorePids = self.ignorePids
-        onlyPusi = self.onlyPusi
-        total = len(data)
+        skipPids = self.skipPids
+        skipNotPusi = self.skipNotPusi
+        ignoreAdaptation = self.ignoreAdaptation
+        ignorePayload = self.ignorePayload
         lastCounter = {}
-        while data:
-            if self.cShow:
-                try:
-                    print("\n".join(self.log))
-                except TypeError:
-                    print("\n".join(map(str, self.log)))
-            self.log.clear()
-            sync = data.read(uint8)
+        for i in count(0, 100):
+            # Read the least information possible in case of skiping
+            sync = read(1)[0]
             if sync != 0x47:
-                raise Exception("Sync should be 0x47, it is 0x%x" % sync)
-            tei, pusi, priority = data.read(bool, 3)
-            pid = read_uint(data, 13)
-            if pid in ignorePids:
-                data.read(bytes, 185)
-                self.cShow = False
+                raise CException("Sync should be 0x47, it is 0x%x" % sync)
+            flagsAndPid = read(2)
+            pid = ((flagsAndPid[0] & 0x1F) << 8) + flagsAndPid[1]
+            if pid in skipPids:
+                read(185)
                 continue
-            tsc = TSC_OPTION[read_uint(data, 2)]
-            adaptationF, payloadF = data.read(bool, 2)
-            counter = read_uint(data, 4)
-            left = data.read(BitStream, PACKET_SIZE)
+            pusi = (flagsAndPid[0] & 0x40) >> 6
+            if skipNotPusi:
+                read(185)
+                continue
+            # Show log of previous packet
+            if self.cShow and log:
+                print("\n".join(log))
+            log_clear()
+            self.cShow = True
+            # Read the rest of the flags and print
+            tei = (flagsAndPid[0] & 0x80) >> 7
+            priority = (flagsAndPid[0] & 0x20) >> 5
+            extraFlags = read(1)[0]
+            tsc = (extraFlags & 0xC0) >> 6
+            counter = extraFlags & 0x0F
+            print(PFMT % (pid, counter, tei, pusi, priority, tsc, i / fSize))
+            # Check for errors in the packet
+            if tei:
+                self.inf(RFMT % "\033[7Transport Error Indicator (TEI)\033[0")
             last = lastCounter.pop(pid, -1)
             if (last + 1) % 16 != counter:
                 if last == -1:
@@ -145,91 +219,59 @@ class Stream():
                     self.inf(RFMT % ("Counter discontinuity, from %d to %d" %
                              (last, counter)))
             lastCounter[pid] = counter
-            if onlyPusi and not pusi:
-                self.cShow = False
-                continue
-            self.inf(PFMT % (pid, counter, tei, pusi, priority, adaptationF,
-                     payloadF, 100 - len(data) * 100 / total, tsc))
-            if tei:
-                self.inf(RFMT % "Transport Error Indicator (TEI)")
-            self.cPid = pid
-            self.cPusi = pusi
-            self.cShow = True
-            self.cIncomplete = False
-            try:
-                self.cProgram = pat[pid]
-            except KeyError:
-                self.cProgram = -1
-            if adaptationF:
-                length = left.read(uint8)
+            left = 184
+            # Parse adaptation
+            if extraFlags & 0x20:
+                length = read(1)[0]
                 if length:
-                    if self.hideAdaptation:
-                        left.read(bytes, length)
-                    else:
-                        self.parse_adaptation(left.read(BitStream,
-                                                        length * 8), 1)
-            if payloadF:
-                if left:
-                    self.parse_payload(left, 1)
-            if self.cIncomplete:
-                self.inf(S + RFMT % "Incomplete payload")
+                    adaptation = read(length)
+                    if not ignoreAdaptation:
+                        self.parse_adaptation(adaptation)
+                left -= length + 1
+            # Parse payload
+            if extraFlags & 0x10:
+                payload = read(left)
+                if not ignorePayload:
+                    self.cPid = pid
+                    self.cPusi = pusi
+                    try:
+                        self.cProgram = pat[pid]
+                    except KeyError:
+                        self.cProgram = -1
+                    self.parse_payload(payload)
+                    if self.cIncomplete:
+                        self.inf(S + RFMT % "Incomplete payload")
 
-    def parse_adaptation(self, data, n=0):
-        (discontinuity, rai, streamPriority, pcrF, opcrF, spliceF,
-         privateF, extensionF) = data.read(bool, 8)
-        self.inf(S * n + "ADAPTATION (%d)" % (len(data) // 8 + 1))
-        self.inf(S * n + "FLAGS: %d|%d|%d|%d|%d|%d|%d|%d" %
-                 (discontinuity, rai, streamPriority, pcrF, opcrF, spliceF,
-                  privateF, extensionF))
-        pcr = opcr = 0
-        if pcrF:
-            pcr = read_based_timestamp(data)
-            self.inf(S + "PCR -> %d" % pcr)
-            if opcrF:
-                opcr = read_based_timestamp(data)
-                self.inf(S * n + "OPCR -> %d" % opcr)
-        if spliceF:
-            splice = data.read(int8)
-        if privateF:
-            length = data.read(uint8)
-            private = data.read(bytes, length)
-        if extensionF:
-            length = data.read(uint8)
-            extension = data.read(BitStream, length * 8)
-            ltwF, pieceWiseF, seamlessF = extension.read(bool, 3)
-            self.inf(S * n + "EXTENSION (%d) %d|%d|%d" %
-                     (length, ltwF, pieceWiseF, seamlessF))
-            extension.read(bool, 5)
-            if ltwF:
-                valid = extension.read(bool, 1)
-                offset = extension.read(BitStream, 15)
-            if pieceWiseF:
-                extension.read(bool, 2)
-                rate = read_uint(extension, 22)
-            if seamlessF:
-                spliceType = read_uint(extension, 4)
-                nextDts = read_timestamp(extension)
-            if extension:
-                raise Exception("Bits left in extension:\n%s" % extension)
-        if data:
-            self.inf(S * n + check(data))
+    def parse_adaptation(self, data):
+        """Parse very few parameters of adaptation
+            There are 8 bit flags in the following order:
+                [0] discontinuity, [1] rai, [2] streamPriority, [3] pcr,
+                [4] opcr, [5] splice, [6] private, [7] extension"""
+        flags = toBits(data[0])
+        self.inf("   ADAPTATION(%03d) %d|%d|%d|%d|%d|%d|%d|%d" %
+                 (len(data), *flags))
+        if flags[3]:
+            pcr = parse_based_timestamp_2(data[1:7])
+            self.inf("   PCR -> %d" % pcr)
+            if flags[4]:
+                opcr = parse_based_timestamp_2(data[7:13])
+                self.inf("   OPCR -> %d" % opcr)
+        # Rest of the data is ignored
 
-    def parse_payload(self, data, n=0):
-        self.inf(S * n + "PAYLOAD (%03d)" % (len(data) // 8))
-        if self.cPusi:
-            first = read_uint(data.copy(24), 24)
-            if first == PES_MASK:
-                if self.ignorePES:
-                    self.cShow = False
-                    return
-                self.parse_PES(data, n + 1)
-            elif first | TEI_MASK == MIP_MASK:
-                raise NotImplementedError("DVB-MIP")
-            else:
-                if self.ignorePSI:
-                    self.cShow = False
-                    return
-                self.parse_PSI(data, n + 1)
+    def parse_payload(self, data):
+        self.inf("   PAYLOAD(%03d)" % (len(data)))
+        if data[0] | data[1] == 0 and data[2] == 1:
+            if self.skipPes:
+                self.cShow = False
+                return
+            self.parse_PES(data)
+        elif data[0] == 0x47 and data[1] | 0x80 == 0xE0 and data[2] == 0x0F:
+            print("\n" * 5 + RFMT % ("DVB-MIP is not implemented") + "\n" * 5)
+        else:
+            if self.skipPsi:
+                self.cShow = False
+                return
+            self.parse_PSI(data)
 
     def parse_PES(self, data, n=0):
         data.read(bytes, 3)
@@ -326,9 +368,6 @@ class Stream():
                         (originalCrc, myCrc))
                 self.inf(S * n + RFMT % text)
             if not (self.cPid or tableId or privateBitF):  # PAT
-                if self.ignorePAT:
-                    self.cShow = False
-                    return
                 while tableData:
                     programNum = read_uint(tableData, 16)
                     tableData.read(bool, 3)
@@ -357,7 +396,7 @@ class Stream():
                              (elementatyPid, streamType, length,
                               _length, pcrPid))
                     if currentF:
-                        self.pcr[elementatyPid] = pcrPid
+                        self.pmt[elementatyPid] = pcrPid
                     if _length:
                         streamDescriptors = tableData.read(BitStream,
                                                            _length * 8)
@@ -405,24 +444,22 @@ class Stream():
             self.inf(S * n + check(data))
 
 
-def main(path, **kw):
-    with open(path, "rb") as f:
-        raw = f.read()
+def main(**kw):
     if "targetPids" in kw:
-        ignorePids = set(range(1 << 13)) - set(kw.pop("targetPids"))
+        skipPids = set(range(1 << 13)) - set(kw.pop("targetPids"))
     else:
-        ignorePids = set(kw.pop("ignorePids", tuple()))
-    stream = Stream(raw, ignorePids, **kw)
+        skipPids = set(kw.pop("skipPids", tuple()))
+    stream = Stream(skipPids, **kw)
     try:
         stream.parse()
-    except KeyboardInterrupt:
-        print(RFMT % "Keyboard interrupt")
-    except Exception as e:
+    except (Exception) as e:
         print(RFMT % str(e))
-    pprint(stream.pat)
-    pprint(stream.pes)
-    print("\n".join(stream.log))
-    print(RFMT % "END OF FILE")
+        print("Happened while parsing:")
+        print("\n".join(stream.log))
+        pprint(stream.pat)
+        pprint(stream.pes)
+    else:
+        print(RFMT % "END OF FILE")
     while True:
         try:
             input("\rPress enter to exit")
@@ -435,6 +472,4 @@ def main(path, **kw):
 if __name__ == "__main__":
     path = ("/home/huxley/Desktop/20180727-145000"
             "-20180727-145500-RGE1_CAT2_REC.ts")
-    main(path, onlyPusi=True, ignorePES=False, ignorePSI=True,
-         hideAdaptation=True, ignorePMT=True, ignorePAT=True,
-         ignoreLeft=False, ignorePids=(21,))
+    main(path=path, ignorePayload=True)
