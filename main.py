@@ -6,6 +6,7 @@ from collections import deque
 from itertools import count
 from struct import pack
 from logging import exception
+from json import dump
 import socket
 
 PFMT = ("\033[46m[%04d]\033[0m\033[36m(%02d)\033[0m %d|%d|%d "
@@ -109,6 +110,7 @@ class Stream():
         self.hidePmt = kw.pop("hidePmt", False)
         self.hideSdt = kw.pop("hideSdt", False)
         self.hideEit = kw.pop("hideEit", False)
+        self.hideTdt = kw.pop("hideTdt", False)
         self.kw = kw
         self.log = deque()
 
@@ -130,11 +132,13 @@ class Stream():
             print("Give either a file path or an ip and a port")
             return
         # Start the variables
+        self.td = (0, 0, 0, 0, 0, 0)
         self.pat = {}
         self.packets = {}
         self.pmt = {}
         self.pcr = {}
         self.sdt = {}
+        self.eit = {}
         self.cShow = False
         # Load the local ones
         log = self.log
@@ -265,6 +269,19 @@ class Stream():
         if length < len(data):
             data = data[:length]
         s_inf("   PSI[%03d] (%d) %d|%d" % (tableId, length, syntaxF, privateF))
+        # Checking TDT since it is a special shorter table
+        if cPid == 20:  # TDT (and TOT)
+            if tableId != 112:  # TDT
+                self.cShow = False
+                return
+            if self.hideTdt:
+                self.cShow = False
+            data = data[-5:]
+            date = (0, 0, 0)
+            time = (0, 0, 0)
+            s_inf("   TDT: Actual time is %d:%d:%d %d/%d/%d" % (*date, *time))
+            self.td = (date, time)
+            return
         # Check CRC32
         originalCrc = parse_crc(data[-4:])
         data = data[:-4]
@@ -295,9 +312,12 @@ class Stream():
                 programPid = ((data[i + 2] & 0x1F) << 8) + data[i + 3]
                 s_inf("      PAT[%d] -> p%d" % (programPid, programNum))
                 self.pat[programPid] = programNum
-        elif self.cProgram >= 0 and not privateF:  # PMT
+        elif tableId == 2 and not privateF:  # PMT
             if self.hidePmt:
                 self.cShow = False
+            if self.cProgram == -1:
+                s_inf("      PMT: PID %d was nor registered in PAT")
+                return
             # Get the PCR associated
             pcrPid = ((data[0] & 0x1F) << 8) + data[1]
             self.pcr[self.cProgram] = pcrPid
@@ -344,22 +364,55 @@ class Stream():
         elif cPid == 18:  # EIT
             if self.hideEit or tableId not in EIT_ACTUAL:
                 self.cShow = False
+            eventList = []
             # Ignoring tsId, OnId, lastN, lastId (6 bytes)
             data = data[6:]
             while data:
                 # Parse headers
                 eventId = (data[0] << 8) + data[1]
-                # TODO: Read starttime{mjd (2b), bcd (3b)} and duration(3b)
-                startTime, duration = 0, 0
+                # TODO: Read date mjd (2b), hour bcd (3b)} and duration bcd(3b)
+                date = (0, 0, 0)
+                hour = (0, 0, 0)
+                duration = (0, 0, 0)
                 running = (data[10] & 0xE0) >> 5
                 s_inf("      EIT[%d] running: %d" % (eventId, running))
+                s_inf("      .      %d-%d-%d %d:%d:%d (%d:%d:%d)" %
+                      (*date, *hour, *duration))
+                event = {"info": "", "extended": "", "date": date,
+                         "hour": hour, "duration": duration, "streams": []}
                 # Parse descriptors
                 length = ((data[10] & 0x0F) << 8) + data[11]
                 data, descriptors = parse_descriptors(data[12:], length)
                 for dTag, dData in descriptors:
-                    s_inf("      EIT TAG[%d]: %s" % (dTag, str(dData)))
+                    if dTag == 77:  # Info
+                        lang = try_decode(dData[:3])
+                        _length = dData[3]
+                        eventName = try_decode(dData[4:_length + 4])
+                        text = try_decode(dData[_length + 5:])
+                        event["info"] = ";".join((lang, eventName, text))
+                    elif dTag == 78:  # Extended
+                        number = (dData[0] & 0xF0) >> 4
+                        lang = try_decode(dData[1:4])
+                        offset = dData[4] + 6
+                        text = try_decode(dData[offset:])
+                        if number == 0:
+                            t = ";".join((lang, text))
+                            event["extended"] = t + event["extended"]
+                        else:
+                            event["extended"] += text
+                    elif dTag == 80:  # Component
+                        content = dData[0] & 0x0F
+                        lang = try_decode(dData[3:6])
+                        event["streams"].append((lang, content))
+                    else:
+                        s_inf("      EIT TAG[%d]: %s" % (dTag, str(dData)))
+                eventList.append(event)
+            self.eit[tableIdExtension] = eventList
         elif tableId == 116:  # application information section
             self.skipPids.add(cPid)  # From now on skip this PID
+            self.cShow = False
+        else:
+            s_inf("   UNRECOGNIZED %d, %d" % (cPid, tableId))
 
 
     def parse_PES(self, data, n=0):
@@ -554,12 +607,15 @@ def main(**kw):
         print("\n".join(stream.log))
     else:
         print(RFMT % "END OF FILE")
-    print("PAT")
-    pprint(stream.pat)
-    print("PMT")
-    pprint(stream.pmt)
-    print("SDT")
-    pprint(stream.sdt)
+    with open("output", "w") as f:
+        print("PAT", file=f)
+        pprint(stream.pat, stream=f)
+        print("\n\nPMT", file=f)
+        pprint(stream.pmt, stream=f)
+        print("\n\nSDT", file=f)
+        pprint(stream.sdt, stream=f)
+        print("\n\nEIT", file=f)
+        pprint(stream.eit, stream=f)
     while True:
         try:
             input("\rPress enter to exit")
@@ -573,4 +629,4 @@ if __name__ == "__main__":
     path = ("/home/huxley/Desktop/20180727-145000"
             "-20180727-145500-RGE1_CAT2_REC.ts")
     main(path=path, skipPes=True, hideNotPusi=True, hidePmt=True, hidePat=True,
-         hideSdt=True)
+         hideSdt=True, hideEit=True, hideTdt=False)
