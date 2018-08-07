@@ -1,6 +1,4 @@
 #! python3
-from bitstream import BitStream
-from numpy import int8, uint8
 from crcmod import predefined
 from pprint import pprint
 from os.path import getsize
@@ -14,90 +12,31 @@ PFMT = ("\033[46m[%04d]\033[0m\033[36m(%02d)\033[0m %d|%d|%d "
         "%d <\033[92m%.3f%%\033[0m>")
 RFMT = "\033[1m\033[91m%s\033[0m"
 GFMT = "\033[1;32m%s\033[0m"
-S = " " * 3
-PACKET_SIZE = 184 * 8  # In bits
 PES_WITH_EXTENSION = set([0xBD])
 PES_WITH_EXTENSION.update(range(0xC0, 0xDF + 1))
 PES_WITH_EXTENSION.update(range(0xE0, 0xEF + 1))
 EIT_ACTUAL = set([0x4E])
 EIT_ACTUAL.update(range(0x50, 0x5F + 1))
-PES_MASK = 0b000000000000000000000001
-MIP_MASK = 0b010001111110000000001111
-TEI_MASK = 0b000000001000000000000000
 crc32 = predefined.mkCrcFun("crc-32-mpeg")
 
 
 class CException(Exception):
+    """Custom Exception"""
     pass
 
 
-def mjd2date(mjd):
-    # TODO: Fix it
-    yearDelay = mjd - 15078.2
-    year = int(yearDelay / 365.25)
-    monthDelay = mjd - 14956.1 - int(yearDelay)
-    month = int(monthDelay / 30.6001)
-    day = int(mjd - 14956 - int(yearDelay) - int(monthDelay))
-    k = (month == 14 or month == 15)
-    year += k
-    month -= 1 + k * 12
-    return (year, month, day)
-
-
-def bcd2hour(bcd):
-    s = hex(bcd)[2:].rjust(6, "0")
-    return [int(i) for i in (s[:2], s[2:4], s[4:])]
-
-
-def read_uint(stream, n):
-    return sum(i << a for a, i in enumerate(stream.read(bool, n)[::-1]))
+def try_decode(b):
+    """Try to decode without throwing any error"""
+    try:
+        return b.decode()
+    except UnicodeDecodeError:
+        return "".join(chr(i) for i in b)
 
 
 def toBits(b):
+    """Return an 8 items list containing each bit in a byte"""
     return ((b & 0x80) >> 7, (b & 0x40) >> 6, (b & 0x20) >> 5, (b & 0x10) >> 4,
             (b & 0x08) >> 3, (b & 0x04) >> 2, (b & 0x02) >> 1, b & 0x01)
-
-
-def read_descriptor(stream):
-    tag = stream.read(uint8)
-    length = stream.read(uint8)
-    data = stream.read(bytes, length)
-    return tag, data
-
-
-def read_descriptors(stream):
-    out = []
-    while stream:
-        out.append(read_descriptor(stream))
-    return out
-
-
-def read_timestamp(stream):
-    ts = read_uint(stream, 3) << 30
-    stream.read(bool, 1)
-    ts += read_uint(stream, 15) << 15
-    stream.read(bool, 1)
-    ts += read_uint(stream, 15)
-    stream.read(bool, 1)
-    return ts
-
-
-def read_based_timestamp(stream):
-    stream.read(bool, 2)
-    base = read_timestamp(stream)
-    extension = read_uint(stream, 9)
-    stream.read(bool, 1)
-    return base * 300 + extension
-
-
-def check(stream):
-    length = len(stream)
-    stuffing = stream.read(bool, length)
-    if all(stuffing):
-        return "**%d Stuffing Bytes" % (length // 8)
-    else:
-        raise Exception("Bits left in stream:\n%s" %
-                        "".join("01"[i] for i in stuffing))
 
 
 def parse_timestamp_2(b):
@@ -115,6 +54,24 @@ def parse_based_timestamp_2(b):
     base = parse_timestamp_2(b)
     extension = ((b[4] & 0x03) << 7) + ((b[5] & 0xFE) >> 1)
     return base * 300 + extension
+
+
+def parse_crc(b):
+    """Parse a 32 bit CRC"""
+    return (b[0] << 24) + (b[1] << 16) + (b[2] << 8) + b[3]
+
+
+def parse_descriptors(data, length):
+    """Return data cut from length and descriptors as pairs (tag, data)"""
+    out = []
+    while length:
+        dTag = data[0]
+        dLength = data[1]
+        dData = data[2:dLength + 2]
+        length -= dLength + 2
+        data = data[dLength + 2:]
+        out.append((dTag, dData))
+    return data, out
 
 
 def read_file(path):
@@ -143,12 +100,15 @@ class Stream():
     def __init__(self, skipPids, **kw):
         # Load the parameters
         self.skipPids = skipPids
-        self.skipNotPusi = kw.pop("skipNotPusi", False)
         self.skipPes = kw.pop("skipPes", False)
         self.skipPsi = kw.pop("skipPsi", False)
         self.ignoreAdaptation = kw.pop("ignoreAdaptation", False)
         self.ignorePayload = kw.pop("ignorePayload", False)
-        self.hideLeft = kw.pop("hideLeft", False)
+        self.hideNotPusi = kw.pop("hideNotPusi", False)
+        self.hidePat = kw.pop("hidePat", False)
+        self.hidePmt = kw.pop("hidePmt", False)
+        self.hideSdt = kw.pop("hideSdt", False)
+        self.hideEit = kw.pop("hideEit", False)
         self.kw = kw
         self.log = deque()
 
@@ -173,15 +133,20 @@ class Stream():
         self.pat = {}
         self.packets = {}
         self.pmt = {}
+        self.pcr = {}
+        self.sdt = {}
         self.cShow = False
         # Load the local ones
         log = self.log
         log_clear = log.clear
+        s_inf = self.inf
+        s_parse_adaptation = self.parse_adaptation
+        s_parse_payload = self.parse_payload
         pat = self.pat
         skipPids = self.skipPids
-        skipNotPusi = self.skipNotPusi
         ignoreAdaptation = self.ignoreAdaptation
         ignorePayload = self.ignorePayload
+        hideNotPusi = self.hideNotPusi
         lastCounter = {}
         for i in count(0, 100):
             # Read the least information possible in case of skiping
@@ -197,10 +162,6 @@ class Stream():
             if pid in skipPids:
                 read(185)
                 continue
-            pusi = (flagsAndPid[0] & 0x40) >> 6
-            if skipNotPusi:
-                read(185)
-                continue
             # Show log of previous packet
             if self.cShow and log:
                 print("\n".join(log))
@@ -208,21 +169,24 @@ class Stream():
             self.cShow = True
             # Read the rest of the flags and print
             tei = (flagsAndPid[0] & 0x80) >> 7
+            pusi = (flagsAndPid[0] & 0x40) >> 6
             priority = (flagsAndPid[0] & 0x20) >> 5
             extraFlags = read(1)[0]
             tsc = (extraFlags & 0xC0) >> 6
             counter = extraFlags & 0x0F
-            print(PFMT % (pid, counter, tei, pusi, priority, tsc, i / fSize))
+            s_inf(PFMT % (pid, counter, tei, pusi, priority, tsc, i / fSize))
+            if hideNotPusi and not pusi:
+                self.cShow = False
             # Check for errors in the packet
             if tei:
-                self.inf(RFMT % "\033[7Transport Error Indicator (TEI)\033[0")
+                s_inf(RFMT % "\033[7Transport Error Indicator (TEI)\033[0")
             last = lastCounter.pop(pid, -1)
             if last != counter:
                 if last == -1:
-                    self.inf(GFMT % "First time we receive this PID")
+                    s_inf(GFMT % "First time we receive this PID")
                 else:
-                    self.inf(RFMT % ("Counter discontinuity, from %d to %d" %
-                             (last, counter)))
+                    s_inf(RFMT % ("Counter discontinuity, from %d to %d" %
+                          (last, counter)))
             lastCounter[pid] = (counter + 1 if extraFlags & 0x10 else 0) % 16
             left = 184
             # Parse adaptation
@@ -231,7 +195,7 @@ class Stream():
                 if length:
                     adaptation = read(length)
                     if not ignoreAdaptation:
-                        self.parse_adaptation(adaptation)
+                        s_parse_adaptation(adaptation)
                 left -= length + 1
             # Parse payload
             if extraFlags & 0x10:
@@ -243,78 +207,160 @@ class Stream():
                         self.cProgram = pat[pid]
                     except KeyError:
                         self.cProgram = -1
-                    self.parse_payload(payload)
+                    s_parse_payload(payload)
 
     def parse_adaptation(self, data):
         """Parse very few parameters of adaptation
             There are 8 bit flags in the following order:
                 [0] discontinuity, [1] rai, [2] streamPriority, [3] pcr,
                 [4] opcr, [5] splice, [6] private, [7] extension"""
+        s_inf = self.inf
         flags = toBits(data[0])
-        self.inf("   ADAPTATION (%03d) %d|%d|%d|%d|%d|%d|%d|%d" %
-                 (len(data), *flags))
+        s_inf("   ADAPTATION (%03d) %d|%d|%d|%d|%d|%d|%d|%d" %
+              (len(data), *flags))
         if flags[3]:
             pcr = parse_based_timestamp_2(data[1:7])
-            self.inf("   PCR -> %d" % pcr)
+            s_inf("   PCR -> %d" % pcr)
             if flags[4]:
                 opcr = parse_based_timestamp_2(data[7:13])
-                self.inf("   OPCR -> %d" % opcr)
+                s_inf("   OPCR -> %d" % opcr)
         # Rest of the data is ignored
 
     def parse_payload(self, data):
-        self.inf("   PAYLOAD (%03d)" % (len(data)))
+        cPid = self.cPid
+        packets = self.packets
         if self.cPusi:
-            if data[0] | data[1] == 0 and data[2] == 1:
-                if self.skipPes:
+            if data[0] | data[1] == 0 and data[2] == 1:  # PES
+                if self.skipPes or 1:
+                    self.skipPids.add(cPid)
                     self.cShow = False
                     return
-                self.buffer_PES(data)
+                # TODO: Buffer and parse PES
             elif (data[0] == 0x47 and data[1] | 0x80 == 0xE0 and
-                  data[2] == 0x0F):
+                  data[2] == 0x0F):  # DVB-MIP
                 self.inf("\n\n\n\n\n" + RFMT % ("DVB-MIP is not implemented"))
                 return
-            else:
+            else:  # PSI
                 if self.skipPsi:
+                    self.skipPids.add(cPid)
                     self.cShow = False
                     return
-                if self.cPid in self.packets:
-                    # TODO: Parse PSI
-                    pprint(self.packets[self.cPid])
-                self.buffer_PSI(data)
-        try:
-            packet = self.packets[self.cPid]
-        except KeyError:
-            packet = None
-        if not self.cPusi:
-            if packet:
-                packet["buffer"] += data
-                packet["copied"] += len(data)
-            else:
+                if cPid in packets:
+                    self.parse_PSI(packets[cPid])
+                packets[cPid] = data[data[0] + 1:]
+        else:
+            try:
+                packets[cPid] += data
+            except KeyError:
                 self.inf(RFMT % "Incomplete data does not match previous PID")
-                return
 
-    def buffer_PES(self, data):
-        streamId = data[3]
-        if streamId == 14 or streamId == 13:
-            print(data)
-        length = (data[4] << 8) + data[5]
-        hasExtension = streamId in PES_WITH_EXTENSION
-        self.inf("   PES[%03d] (%d/%d) e{%d}" % (streamId, len(data) - 6,
-                 length, hasExtension))
-        self.packets[self.cPid] = {
-            "length": length, "copied": len(data) - 6, "buffer": data[6:],
-            "type": "pes", "extraId": streamId}
+    def parse_PSI(self, data):
+        s_inf = self.inf
+        cPid = self.cPid
+        # Get headers
+        tableId = data[0]
+        syntaxF = (data[1] & 0x80) >> 7
+        privateF = (data[1] & 0x40) >> 6
+        length = ((data[1] & 0x0F) << 8) + data[2] + 3
+        if length < len(data):
+            data = data[:length]
+        s_inf("   PSI[%03d] (%d) %d|%d" % (tableId, length, syntaxF, privateF))
+        # Check CRC32
+        originalCrc = parse_crc(data[-4:])
+        data = data[:-4]
+        myCrc = crc32(data)
+        if originalCrc != myCrc:
+            s_inf(RFMT % ("   CRC32 does not match: o{%d} m{%d}" %
+                  (originalCrc, myCrc)))
+        # Get extended headers
+        if not (syntaxF and length):
+            return
+        tableIdExtension = (data[3] << 8) + data[4]
+        version = data[5] & 0x3E
+        currentF = data[5] & 0x01
+        section = data[6]
+        last = data[7]
+        data = data[8:]
+        if not currentF:
+            s_inf(RFMT % "   PSI has no current flag: ignored")
+        s_inf("   >[%03d] v%d %d/%d" %
+              (tableIdExtension, version, section, last))
+        # Clasify the table
+        if not (cPid or tableId or privateF):  # PAT
+            if self.hidePat:
+                self.cShow = False
+            # Associate program numbers to PIDs
+            for i in range(0, len(data), 4):
+                programNum = (data[i] << 8) + data[i + 1]
+                programPid = ((data[i + 2] & 0x1F) << 8) + data[i + 3]
+                s_inf("      PAT[%d] -> p%d" % (programPid, programNum))
+                self.pat[programPid] = programNum
+        elif self.cProgram >= 0 and not privateF:  # PMT
+            if self.hidePmt:
+                self.cShow = False
+            # Get the PCR associated
+            pcrPid = ((data[0] & 0x1F) << 8) + data[1]
+            self.pcr[self.cProgram] = pcrPid
+            # Parse program descriptors
+            programLength = ((data[2] & 0x03) << 8) + data[3]
+            data, programD = parse_descriptors(data[4:], programLength)
+            for dTag, dData in programD:
+                s_inf("      PMT TAG[%d]: %s" % (dTag, str(dData)))
+            # Get type and pid of the ES
+            sType = data[0]
+            ePid = ((data[1] & 0x1F) << 8) + data[2]
+            self.pmt[self.cProgram] = (sType, ePid)
+            s_inf("      PMT[%d]: (%d, %d)" % (self.cProgram, sType, ePid))
+            # Parse ES descriptors
+            esLength = ((data[3] & 0x03) << 8) + data[4]
+            data, esD = parse_descriptors(data[5:], esLength)
+            for dTag, dData in esD:
+                s_inf("      PMT TAG[%d]: %s" % (dTag, str(dData)))
+        elif cPid == 17:  # SDT
+            if self.hideSdt:
+                self.cShow = False
+            # Ignoring original_network_id (2 bytes)
+            data = data[3:]
+            while data:
+                # Parse headers
+                serviceId = (data[0] << 8) + data[1]
+                running = (data[3] & 0xE0) >> 5
+                s_inf("      SDT[%d] running: %d" % (serviceId, running))
+                # Parse descriptors
+                length = ((data[3] & 0x0F) << 8) + data[4]
+                data, descriptors = parse_descriptors(data[5:], length)
+                for dTag, dData in descriptors:
+                    if dTag == 72:  # Service descriptor
+                        serviceType = dData[0]
+                        _length = dData[1]
+                        serviceProvider = try_decode(dData[2:_length + 2])
+                        serviceName = try_decode(dData[_length + 3:])
+                        self.sdt[serviceId] = (serviceType, serviceProvider,
+                                               serviceName)
+                    elif dTag == 93:  # Multilingual
+                        pass
+                    else:
+                        s_inf("      SDT TAG[%d]: %s" % (dTag, str(dData)))
+        elif cPid == 18:  # EIT
+            if self.hideEit or tableId not in EIT_ACTUAL:
+                self.cShow = False
+            # Ignoring tsId, OnId, lastN, lastId (6 bytes)
+            data = data[6:]
+            while data:
+                # Parse headers
+                eventId = (data[0] << 8) + data[1]
+                # TODO: Read starttime{mjd (2b), bcd (3b)} and duration(3b)
+                startTime, duration = 0, 0
+                running = (data[10] & 0xE0) >> 5
+                s_inf("      EIT[%d] running: %d" % (eventId, running))
+                # Parse descriptors
+                length = ((data[10] & 0x0F) << 8) + data[11]
+                data, descriptors = parse_descriptors(data[12:], length)
+                for dTag, dData in descriptors:
+                    s_inf("      EIT TAG[%d]: %s" % (dTag, str(dData)))
+        elif tableId == 116:  # application information section
+            self.skipPids.add(cPid)  # From now on skip this PID
 
-    def buffer_PSI(self, data):
-        offset = data[0] + 1
-        tableId = data[offset]
-        flagsAndLength = data[offset + 1]
-        length = (flagsAndLength & 0x0F) + data[offset + 1]
-        self.inf("   PSI[%03d] (%d/%d)" %
-                 (tableId, len(data) - offset - 3, length))
-        self.packets[self.cPid] = {
-            "length": length, "copied": len(data) - offset - 3,
-            "buffer": data[offset + 3:], "type": "psi", "extraId": tableId}
 
     def parse_PES(self, data, n=0):
         data.read(bytes, 3)
@@ -380,7 +426,7 @@ class Stream():
         if data and not self.ignoreLeft:
             self.inf(S * n + str(data.read(bytes, len(data) // 8)))
 
-    def parse_PSI(self, data, n=0):
+    def parse__PSI(self, data, n=0):
         data.read(bytes, data.read(uint8))
         copy = data.copy(24)
         tableId = data.read(uint8)
@@ -492,7 +538,10 @@ def main(**kw):
         skipPids = set(range(1 << 13)) - set(kw.pop("targetPids"))
     else:
         skipPids = set(kw.pop("skipPids", tuple()))
-    skipPids.add(8191)
+    skipPids.add(8191)  # Stuffing packet
+    skipPids.add(21)  # Network synchronization
+    skipPids.add(1)  # CAT
+    skipPids.add(16)  # NIT
     stream = Stream(skipPids, **kw)
     try:
         stream.parse()
@@ -503,10 +552,14 @@ def main(**kw):
         exception(e)
         print("Happened while parsing:")
         print("\n".join(stream.log))
-        pprint(stream.pat)
-        pprint(stream.packets)
     else:
         print(RFMT % "END OF FILE")
+    print("PAT")
+    pprint(stream.pat)
+    print("PMT")
+    pprint(stream.pmt)
+    print("SDT")
+    pprint(stream.sdt)
     while True:
         try:
             input("\rPress enter to exit")
@@ -519,4 +572,5 @@ def main(**kw):
 if __name__ == "__main__":
     path = ("/home/huxley/Desktop/20180727-145000"
             "-20180727-145500-RGE1_CAT2_REC.ts")
-    main(path=path, ignorePayload=False)
+    main(path=path, skipPes=True, hideNotPusi=True, hidePmt=True, hidePat=True,
+         hideSdt=True)
