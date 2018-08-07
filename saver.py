@@ -3,6 +3,8 @@ import socket
 from struct import pack
 from os.path import getsize
 from itertools import count
+from threading import Thread
+from collections import deque
 
 PFMT = "\033[46m[%04d]\033[0m<\033[92m%.3f%%\033[0m>"
 RFMT = "\033[1m\033[91m%s\033[0m"
@@ -30,6 +32,33 @@ def read_udp(ip, port):
     return wrapper
 
 
+class Writer():
+    def __init__(self, path):
+        self.on = True
+        self.file = open(path, "wb")
+        self.queue = deque()
+        self.thread = Thread(target=self.loop, daemon=True)
+        self.thread.start()
+
+    def loop(self):
+        queue_copy = self.queue.copy
+        queue_popleft = self.queue.popleft
+        file_write = self.file.write
+        while self.on:
+            for i in queue_copy():
+                file_write(i)
+                queue_popleft()
+        print("Exited the loop")
+        for i in queue_copy():
+            file_write(i)
+            queue_popleft()
+
+    def stop(self):
+        self.on = False
+        self.thread.join()
+        print("Finished writing")
+
+
 def parse(**kw):
     """Enter a loop that parses the stream and prints the info"""
     if "targetPids" in kw:
@@ -49,9 +78,19 @@ def parse(**kw):
         return
     # Start loop
     out = kw.pop("out", "save.ts")
-    show = kw.pop("show", False)
+    every = kw.pop("every", 1)
+    if fSize == float("inf"):
+        every *= 2000000
+    else:
+        every *= fSize // 99.9 * 100
+    writer = Writer(out)
+    write = writer.queue.append
     for i in count(0, 100):
-        sync = read(1)[0]
+        try:
+            sync = read(1)[0]
+        except IndexError:
+            if i // 100 == fSize:
+                break
         if sync != 0x47:
             raise Exception("Sync should be 0x47, it is 0x%x" % sync)
         flagsAndPid = read(2)
@@ -59,11 +98,13 @@ def parse(**kw):
         if pid in skipPids:
             read(185)
             continue
-        if show:
+        if not i % every:
             print(PFMT % (pid, i / fSize))
-        with open(out, "ab") as f:
-            f.write(b"\x47" + flagsAndPid + read(185))
+        write(b"\x47" + flagsAndPid + read(185))
+    print("Finished reading")
+    writer.stop()
 
 if __name__ == "__main__":
-    path = ("/home/path")
-    parse(path=path, out="save.ts", show=True, skipPids=(0x192, 0x193, 0x194))
+    path = ("/home/huxley/Desktop/20180727-145000"
+            "-20180727-145500-RGE1_CAT2_REC.ts")
+    parse(path=path, out="save.ts", skipPids=(0x192, 0x193, 0x194), every=10)
