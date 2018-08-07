@@ -7,9 +7,10 @@ from os.path import getsize
 from collections import deque
 from itertools import count
 from struct import pack
+from logging import exception
 import socket
 
-PFMT = ("\033[46m[%04d]\033[0m\033[36m(%02d)\033[0m %d|\033[36m%d\033[0m|%d "
+PFMT = ("\033[46m[%04d]\033[0m\033[36m(%02d)\033[0m %d|%d|%d "
         "%d <\033[92m%.3f%%\033[0m>")
 RFMT = "\033[1m\033[91m%s\033[0m"
 GFMT = "\033[1;32m%s\033[0m"
@@ -159,8 +160,8 @@ class Stream():
         # Prepare the file / udp
         kw = self.kw
         if "path" in kw:
-            read = read_file(kw["file"])
-            fSize = getsize(kw["file"]) // 188
+            read = read_file(kw["path"])
+            fSize = getsize(kw["path"]) // 188
         elif "ip" in kw and "port" in kw:
             read = read_udp(kw["ip"], kw["port"])
             fSize = float("inf")
@@ -170,7 +171,7 @@ class Stream():
             return
         # Start the variables
         self.pat = {}
-        self.pes = {}
+        self.packets = {}
         self.pmt = {}
         self.cShow = False
         # Load the local ones
@@ -184,7 +185,11 @@ class Stream():
         lastCounter = {}
         for i in count(0, 100):
             # Read the least information possible in case of skiping
-            sync = read(1)[0]
+            try:
+                sync = read(1)[0]
+            except IndexError:
+                if i // 100 == fSize:
+                    break
             if sync != 0x47:
                 raise CException("Sync should be 0x47, it is 0x%x" % sync)
             flagsAndPid = read(2)
@@ -212,13 +217,13 @@ class Stream():
             if tei:
                 self.inf(RFMT % "\033[7Transport Error Indicator (TEI)\033[0")
             last = lastCounter.pop(pid, -1)
-            if (last + 1) % 16 != counter:
+            if last != counter:
                 if last == -1:
                     self.inf(GFMT % "First time we receive this PID")
                 else:
                     self.inf(RFMT % ("Counter discontinuity, from %d to %d" %
                              (last, counter)))
-            lastCounter[pid] = counter
+            lastCounter[pid] = (counter + 1 if extraFlags & 0x10 else 0) % 16
             left = 184
             # Parse adaptation
             if extraFlags & 0x20:
@@ -239,8 +244,6 @@ class Stream():
                     except KeyError:
                         self.cProgram = -1
                     self.parse_payload(payload)
-                    if self.cIncomplete:
-                        self.inf(S + RFMT % "Incomplete payload")
 
     def parse_adaptation(self, data):
         """Parse very few parameters of adaptation
@@ -248,7 +251,7 @@ class Stream():
                 [0] discontinuity, [1] rai, [2] streamPriority, [3] pcr,
                 [4] opcr, [5] splice, [6] private, [7] extension"""
         flags = toBits(data[0])
-        self.inf("   ADAPTATION(%03d) %d|%d|%d|%d|%d|%d|%d|%d" %
+        self.inf("   ADAPTATION (%03d) %d|%d|%d|%d|%d|%d|%d|%d" %
                  (len(data), *flags))
         if flags[3]:
             pcr = parse_based_timestamp_2(data[1:7])
@@ -259,19 +262,59 @@ class Stream():
         # Rest of the data is ignored
 
     def parse_payload(self, data):
-        self.inf("   PAYLOAD(%03d)" % (len(data)))
-        if data[0] | data[1] == 0 and data[2] == 1:
-            if self.skipPes:
-                self.cShow = False
+        self.inf("   PAYLOAD (%03d)" % (len(data)))
+        if self.cPusi:
+            if data[0] | data[1] == 0 and data[2] == 1:
+                if self.skipPes:
+                    self.cShow = False
+                    return
+                self.buffer_PES(data)
+            elif (data[0] == 0x47 and data[1] | 0x80 == 0xE0 and
+                  data[2] == 0x0F):
+                self.inf("\n\n\n\n\n" + RFMT % ("DVB-MIP is not implemented"))
                 return
-            self.parse_PES(data)
-        elif data[0] == 0x47 and data[1] | 0x80 == 0xE0 and data[2] == 0x0F:
-            print("\n" * 5 + RFMT % ("DVB-MIP is not implemented") + "\n" * 5)
-        else:
-            if self.skipPsi:
-                self.cShow = False
+            else:
+                if self.skipPsi:
+                    self.cShow = False
+                    return
+                if self.cPid in self.packets:
+                    # TODO: Parse PSI
+                    pprint(self.packets[self.cPid])
+                self.buffer_PSI(data)
+        try:
+            packet = self.packets[self.cPid]
+        except KeyError:
+            packet = None
+        if not self.cPusi:
+            if packet:
+                packet["buffer"] += data
+                packet["copied"] += len(data)
+            else:
+                self.inf(RFMT % "Incomplete data does not match previous PID")
                 return
-            self.parse_PSI(data)
+
+    def buffer_PES(self, data):
+        streamId = data[3]
+        if streamId == 14 or streamId == 13:
+            print(data)
+        length = (data[4] << 8) + data[5]
+        hasExtension = streamId in PES_WITH_EXTENSION
+        self.inf("   PES[%03d] (%d/%d) e{%d}" % (streamId, len(data) - 6,
+                 length, hasExtension))
+        self.packets[self.cPid] = {
+            "length": length, "copied": len(data) - 6, "buffer": data[6:],
+            "type": "pes", "extraId": streamId}
+
+    def buffer_PSI(self, data):
+        offset = data[0] + 1
+        tableId = data[offset]
+        flagsAndLength = data[offset + 1]
+        length = (flagsAndLength & 0x0F) + data[offset + 1]
+        self.inf("   PSI[%03d] (%d/%d)" %
+                 (tableId, len(data) - offset - 3, length))
+        self.packets[self.cPid] = {
+            "length": length, "copied": len(data) - offset - 3,
+            "buffer": data[offset + 3:], "type": "psi", "extraId": tableId}
 
     def parse_PES(self, data, n=0):
         data.read(bytes, 3)
@@ -449,15 +492,19 @@ def main(**kw):
         skipPids = set(range(1 << 13)) - set(kw.pop("targetPids"))
     else:
         skipPids = set(kw.pop("skipPids", tuple()))
+    skipPids.add(8191)
     stream = Stream(skipPids, **kw)
     try:
         stream.parse()
-    except (Exception) as e:
+    except KeyboardInterrupt:
+        print(RFMT % "Keyboard Interrupt")
+    except Exception as e:
         print(RFMT % str(e))
+        exception(e)
         print("Happened while parsing:")
         print("\n".join(stream.log))
         pprint(stream.pat)
-        pprint(stream.pes)
+        pprint(stream.packets)
     else:
         print(RFMT % "END OF FILE")
     while True:
@@ -472,4 +519,4 @@ def main(**kw):
 if __name__ == "__main__":
     path = ("/home/huxley/Desktop/20180727-145000"
             "-20180727-145500-RGE1_CAT2_REC.ts")
-    main(path=path, ignorePayload=True)
+    main(path=path, ignorePayload=False)
