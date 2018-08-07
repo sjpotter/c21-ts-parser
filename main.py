@@ -6,6 +6,7 @@ from collections import deque
 from itertools import count
 from struct import pack
 from logging import exception
+from time import gmtime
 import socket
 
 PFMT = ("\033[46m[%04d]\033[0m\033[36m(%02d)\033[0m %d|%d|%d "
@@ -17,7 +18,10 @@ PES_WITH_EXTENSION.update(range(0xC0, 0xDF + 1))
 PES_WITH_EXTENSION.update(range(0xE0, 0xEF + 1))
 EIT_ACTUAL = set([0x4E])
 EIT_ACTUAL.update(range(0x50, 0x5F + 1))
+MJD_TO_UNIX = 40588
+DAY = 86400
 crc32 = predefined.mkCrcFun("crc-32-mpeg")
+# TODO: Create my own CRC32
 
 
 class CException(Exception):
@@ -37,6 +41,16 @@ def toBits(b):
     """Return an 8 items list containing each bit in a byte"""
     return ((b & 0x80) >> 7, (b & 0x40) >> 6, (b & 0x20) >> 5, (b & 0x10) >> 4,
             (b & 0x08) >> 3, (b & 0x04) >> 2, (b & 0x02) >> 1, b & 0x01)
+
+
+def parse_mjd(b):
+    toUnix = ((b[0] << 8) + b[1] - MJD_TO_UNIX + 1) * DAY
+    toTime = gmtime(toUnix)
+    return (toTime.tm_year, toTime.tm_mon, toTime.tm_mday)
+
+
+def parse_bcd(b):
+    return tuple(int(hex(b[i])[2:]) for i in range(3))
 
 
 def parse_timestamp_2(b):
@@ -234,11 +248,13 @@ class Stream():
         packets = self.packets
         if self.cPusi:
             if data[0] | data[1] == 0 and data[2] == 1:  # PES
-                if self.skipPes or 1:
+                if self.skipPes:
                     self.skipPids.add(cPid)
                     self.cShow = False
                     return
-                # TODO: Buffer and parse PES
+                if cPid in packets:
+                    print("It is", len(packets[cPid]))  # TODO: PARSE PES
+                packets[cPid] = data[3:]
             elif (data[0] == 0x47 and data[1] | 0x80 == 0xE0 and
                   data[2] == 0x0F):  # DVB-MIP
                 self.inf("\n\n\n\n\n" + RFMT % ("DVB-MIP is not implemented"))
@@ -276,10 +292,10 @@ class Stream():
             if self.hideTdt:
                 self.cShow = False
             data = data[-5:]
-            date = (0, 0, 0)
-            time = (0, 0, 0)
+            date = parse_mjd(data)
+            time = parse_bcd(data[2:])
             s_inf("   TDT: Actual time is %d:%d:%d %d/%d/%d" % (*date, *time))
-            self.td = (date, time)
+            self.td = (*date, *time)
             return
         # Check CRC32
         originalCrc = parse_crc(data[-4:])
@@ -361,18 +377,20 @@ class Stream():
                     else:
                         s_inf("      SDT TAG[%d]: %s" % (dTag, str(dData)))
         elif cPid == 18:  # EIT
-            if self.hideEit or tableId not in EIT_ACTUAL:
+            if self.hideEit:
                 self.cShow = False
+            if tableId not in EIT_ACTUAL:
+                self.cShow = False
+                return
             eventList = []
             # Ignoring tsId, OnId, lastN, lastId (6 bytes)
             data = data[6:]
             while data:
                 # Parse headers
                 eventId = (data[0] << 8) + data[1]
-                # TODO: Read date mjd (2b), hour bcd (3b)} and duration bcd(3b)
-                date = (0, 0, 0)
-                hour = (0, 0, 0)
-                duration = (0, 0, 0)
+                date = parse_mjd(data[2:])
+                hour = parse_bcd(data[4:])
+                duration = parse_bcd(data[7:])
                 running = (data[10] & 0xE0) >> 5
                 s_inf("      EIT[%d] running: %d" % (eventId, running))
                 s_inf("      .      %d-%d-%d %d:%d:%d (%d:%d:%d)" %
@@ -444,6 +462,7 @@ def main(**kw):
         pprint(stream.sdt, stream=f)
         print("\n\nEIT", file=f)
         pprint(stream.eit, stream=f)
+    print("Time and Date was %d/%d/%d %d:%d:%d" % stream.td)
     while True:
         try:
             input("\rPress enter to exit")
@@ -456,5 +475,5 @@ def main(**kw):
 if __name__ == "__main__":
     path = ("/home/huxley/Desktop/20180727-145000"
             "-20180727-145500-RGE1_CAT2_REC.ts")
-    main(path=path, skipPes=True, hideNotPusi=True, hidePmt=True, hidePat=True,
-         hideSdt=True, hideEit=True, hideTdt=True)
+    main(path=path, hideNotPusi=True, hidePmt=True, hidePat=True,
+         hideSdt=True, hideEit=True, hideTdt=True, skipPes=True)
