@@ -1,5 +1,4 @@
 #! python3
-from crcmod import predefined
 from pprint import pprint
 from os.path import getsize
 from collections import deque
@@ -20,8 +19,25 @@ EIT_ACTUAL = set([0x4E])
 EIT_ACTUAL.update(range(0x50, 0x5F + 1))
 MJD_TO_UNIX = 40588
 DAY = 86400
-crc32 = predefined.mkCrcFun("crc-32-mpeg")
-# TODO: Create my own CRC32
+crcPol = 0x04c11db7
+crcTable = []
+crcBigMask = 0xFFFFFFFF
+crcSmallMask = 0x80000000
+for i in range(256):
+    rev = i << 24
+    for j in range(8):
+        if rev & crcSmallMask:
+            rev = (rev << 1) ^ crcPol
+        else:
+            rev <<= 1
+    crcTable.append(rev & crcBigMask)
+
+
+def crc32(b):
+    value = crcBigMask
+    for i in b:
+        value = ((value << 8) ^ crcTable[((value >> 24) ^ i) & 0xFF]) & crcBigMask
+    return value
 
 
 class CException(Exception):
