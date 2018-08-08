@@ -86,6 +86,12 @@ def parse_based_timestamp_2(b):
     return base * 300 + extension
 
 
+def parse_pcr(b):
+    base = (b[0] << 25) + (b[1] << 17) + (b[2] << 11) + (b[3] << 3) + b[4] >> 5
+    extension = ((b[4] & 0x01) << 8) + b[5]
+    return base * 300 + extension
+
+
 def parse_crc(b):
     """Parse a 32 bit CRC"""
     return (b[0] << 24) + (b[1] << 16) + (b[2] << 8) + b[3]
@@ -256,10 +262,10 @@ class Stream():
         s_inf("   ADAPTATION (%03d) %d|%d|%d|%d|%d|%d|%d|%d" %
               (len(data), *flags))
         if flags[3]:
-            pcr = parse_based_timestamp_2(data[1:7])
+            pcr = parse_pcr(data[1:7])
             s_inf("   PCR -> %d" % pcr)
             if flags[4]:
-                opcr = parse_based_timestamp_2(data[7:13])
+                opcr = parse_pcr(data[7:13])
                 s_inf("   OPCR -> %d" % opcr)
         # Rest of the data is ignored
 
@@ -498,5 +504,5 @@ if __name__ == "__main__":
             "-20180727-145500-RGE1_CAT2_REC.ts")
     path = ("C:/users/angel/Desktop/20180727-145000"
             "-20180727-145500-RGE1_CAT2_REC.ts")
-    main(path=path, hideNotPusi=True, hidePmt=False, hidePat=True,
+    main(path=path, hideNotPusi=True, hidePmt=True, hidePat=True,
          hideSdt=True, hideEit=True, hideTdt=True, skipPes=True)
