@@ -145,6 +145,10 @@ class Stream():
 
     def inf(self, s):
         self.log.append(s)
+    
+    def ignore_pid(self, pid):
+        self.skipPids.add(pid)
+        self.packets.pop(pid, None)
 
     def parse(self):
         """Enter a loop that parses the stream and prints the info"""
@@ -265,7 +269,7 @@ class Stream():
         if self.cPusi:
             if data[0] | data[1] == 0 and data[2] == 1:  # PES
                 if self.skipPes:
-                    self.skipPids.add(cPid)
+                    self.ignore_pid(cPid)
                     self.cShow = False
                     return
                 if cPid in packets:
@@ -277,7 +281,7 @@ class Stream():
                 return
             else:  # PSI
                 if self.skipPsi:
-                    self.skipPids.add(cPid)
+                    self.ignore_pid(cPid)
                     self.cShow = False
                     return
                 if cPid in packets:
@@ -357,16 +361,17 @@ class Stream():
             data, programD = parse_descriptors(data[4:], programLength)
             for dTag, dData in programD:
                 s_inf("      PMT TAG[%d]: %s" % (dTag, str(dData)))
-            # Get type and pid of the ES
-            sType = data[0]
-            ePid = ((data[1] & 0x1F) << 8) + data[2]
-            self.pmt[self.cProgram] = (sType, ePid)
-            s_inf("      PMT[%d]: (%d, %d)" % (self.cProgram, sType, ePid))
-            # Parse ES descriptors
-            esLength = ((data[3] & 0x03) << 8) + data[4]
-            data, esD = parse_descriptors(data[5:], esLength)
-            for dTag, dData in esD:
-                s_inf("      PMT TAG[%d]: %s" % (dTag, str(dData)))
+            while data:
+                # Get type and pid of the ES
+                sType = data[0]
+                ePid = ((data[1] & 0x1F) << 8) + data[2]
+                self.pmt[self.cProgram] = (sType, ePid)
+                s_inf("      PMT[%d]: (%d, %d)" % (self.cProgram, sType, ePid))
+                # Parse ES descriptors
+                esLength = ((data[3] & 0x03) << 8) + data[4]
+                data, esD = parse_descriptors(data[5:], esLength)
+                for dTag, dData in esD:
+                    s_inf("      PMT TAG[%d]: %s" % (dTag, str(dData)))
         elif cPid == 17:  # SDT
             if self.hideSdt:
                 self.cShow = False
@@ -442,7 +447,7 @@ class Stream():
                 eventList.append(event)
             self.eit[tableIdExtension] = eventList
         elif tableId == 116:  # application information section
-            self.skipPids.add(cPid)  # From now on skip this PID
+            self.ignore_pid(cPid)
             self.cShow = False
         else:
             s_inf("   UNRECOGNIZED %d, %d" % (cPid, tableId))
@@ -491,5 +496,7 @@ def main(**kw):
 if __name__ == "__main__":
     path = ("/home/huxley/Desktop/20180727-145000"
             "-20180727-145500-RGE1_CAT2_REC.ts")
-    main(path=path, hideNotPusi=True, hidePmt=True, hidePat=True,
+    path = ("C:/users/angel/Desktop/20180727-145000"
+            "-20180727-145500-RGE1_CAT2_REC.ts")
+    main(path=path, hideNotPusi=True, hidePmt=False, hidePat=True,
          hideSdt=True, hideEit=True, hideTdt=True, skipPes=True)
