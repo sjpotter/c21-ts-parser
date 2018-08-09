@@ -35,7 +35,7 @@ def read_udp(ip, port):
 class Writer():
     def __init__(self, path):
         self.on = True
-        self.file = open(path, "wb")
+        self.file = path
         self.queue = deque()
         self.thread = Thread(target=self.loop, daemon=True)
         self.thread.start()
@@ -43,15 +43,21 @@ class Writer():
     def loop(self):
         queue_copy = self.queue.copy
         queue_popleft = self.queue.popleft
-        file_write = self.file.write
+        path = self.file
         while self.on:
+            f = open(path, "ab")
+            f_write = f.write
             for i in queue_copy():
-                file_write(i)
+                f_write(i)
                 queue_popleft()
+            f.close()
         print("Exited the loop")
+        f = open(path, "ab")
+        f_write = f.write
         for i in queue_copy():
-            file_write(i)
+            f_write(i)
             queue_popleft()
+        f.close()
 
     def stop(self):
         self.on = False
@@ -106,5 +112,7 @@ def parse(**kw):
 
 if __name__ == "__main__":
     path = ("/home/huxley/Desktop/20180727-145000"
+            "-20180727-145500-RGE1_CAT2_REC.ts")
+    path = ("C:/users/angel/Desktop/20180727-145000"
             "-20180727-145500-RGE1_CAT2_REC.ts")
     parse(path=path, out="save.ts", skipPids=(0x192, 0x193, 0x194), every=10)
