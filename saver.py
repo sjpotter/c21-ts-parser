@@ -1,68 +1,10 @@
 #! python3
-import socket
-from struct import pack
 from os.path import getsize
 from itertools import count
-from threading import Thread
-from collections import deque
+import iotools
 
 PFMT = "\033[46m[%04d]\033[0m<\033[92m%.3f%%\033[0m>"
 RFMT = "\033[1m\033[91m%s\033[0m"
-
-
-def read_file(path):
-    """Read from a ts file at path"""
-    def wrapper(n):
-        return f_read(n)
-    f = open(path, "rb")
-    f_read = f.read
-    return wrapper
-
-
-def read_udp(ip, port):
-    """Read from udp://ip:port"""
-    def wrapper(n):
-        return s_recv(n)
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
-    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    s.bind((ip, port))
-    request = pack("4sl", socket.inet_aton(ip), socket.INADDR_ANY)
-    s.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, request)
-    s_recv = s.recv
-    return wrapper
-
-
-class Writer():
-    def __init__(self, path):
-        self.on = True
-        self.file = path
-        self.queue = deque()
-        self.thread = Thread(target=self.loop, daemon=True)
-        self.thread.start()
-
-    def loop(self):
-        queue_copy = self.queue.copy
-        queue_popleft = self.queue.popleft
-        path = self.file
-        while self.on:
-            f = open(path, "ab")
-            f_write = f.write
-            for i in queue_copy():
-                f_write(i)
-                queue_popleft()
-            f.close()
-        print("Exited the loop")
-        f = open(path, "ab")
-        f_write = f.write
-        for i in queue_copy():
-            f_write(i)
-            queue_popleft()
-        f.close()
-
-    def stop(self):
-        self.on = False
-        self.thread.join()
-        print("Finished writing")
 
 
 def parse(**kw):
@@ -73,10 +15,10 @@ def parse(**kw):
         skipPids = set(kw.pop("skipPids", tuple()))
     # Prepare the file / udp
     if "path" in kw:
-        read = read_file(kw["path"])
+        read = iotools.read_file(kw["path"])
         fSize = getsize(kw["path"]) // 188
     elif "ip" in kw and "port" in kw:
-        read = read_udp(kw["ip"], kw["port"])
+        read = iotools.read_udp(kw["ip"], kw["port"])
         fSize = float("inf")
     else:
         print(RFMT % "Not enough paramaters given")
@@ -89,7 +31,7 @@ def parse(**kw):
         every *= 2000000
     else:
         every *= fSize // 99.9 * 100
-    writer = Writer(out)
+    writer = iotools.Writer(iotools.write_file_queue(out))
     write = writer.queue.append
     for i in count(0, 100):
         try:
