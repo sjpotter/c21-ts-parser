@@ -32,19 +32,20 @@ def write_file(path):
     def wrapper(data):
         with open(path, "ab") as f:
             f.write(data)
-    return wrapper
+    return (wrapper, "simple")
 
 
 def write_file_queue(path):
     """Write to a ts file at path locking it until it finishes"""
     def wrapper(queue):
+        f = open(path, "ab")
+        f_write = f.write
         queue_popleft = queue.popleft
         for i in queue.copy():
             f_write(i)
             queue_popleft()
-    f = open(path, "ab")
-    f_write = f.write
-    return wrapper
+        f.close()
+    return (wrapper, "complex")
 
 
 def write_udp(ip, port):
@@ -55,7 +56,7 @@ def write_udp(ip, port):
     s.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 2)
     pair = (ip, port)
     s_sendto = s.sendto
-    return wrapper
+    return (wrapper, "simple")
 
 
 class Writer():
@@ -63,28 +64,28 @@ class Writer():
         self.on = True
         self.queue = deque()
         self.thread = Thread(target=self.loop, daemon=True)
+        self.writeArgs = write
         self.thread.start()
-        self.write = write
 
     def loop(self):
         queue = self.queue
         queue_copy = queue.copy
         queue_popleft = queue.popleft
-        write = self.write
-        if write == write_udp or write == write_file:
+        write, name = self.writeArgs
+        if name == "simple":
             while self.on:
                 for i in queue_copy():
                     f_write(i)
                     queue_popleft()
-        elif write == write_file_queue:
+        elif name == "complex":
             while self.on:
                 write(queue)
         print("Exited the loop")
-        if write == write_udp or write == write_file:
+        if name == "simple":
             for i in queue_copy():
                 f_write(i)
                 queue_popleft()
-        elif write == write_file_queue:
+        elif name == "complex":
             write(queue)
 
     def stop(self):
