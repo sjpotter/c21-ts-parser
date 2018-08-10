@@ -3,10 +3,9 @@ from pprint import pprint
 from os.path import getsize
 from collections import deque
 from itertools import count
-from struct import pack
 from logging import exception
 from time import gmtime
-import socket
+import iotools
 
 PFMT = ("\033[46m[%04d]\033[0m\033[36m(%02d)\033[0m %d|%d|%d "
         "%d <\033[92m%.3f%%\033[0m>")
@@ -110,28 +109,6 @@ def parse_descriptors(data, length):
     return data, out
 
 
-def read_file(path):
-    """Read from a ts file at path"""
-    def wrapper(n):
-        return f_read(n)
-    f = open(path, "rb")
-    f_read = f.read
-    return wrapper
-
-
-def read_udp(ip, port):
-    """Read from udp://ip:port"""
-    def wrapper(n):
-        return s_recv(n)
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
-    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    s.bind((ip, port))
-    request = pack("4sl", socket.inet_aton(ip), socket.INADDR_ANY)
-    s.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, request)
-    s_recv = s.recv
-    return wrapper
-
-
 class Stream():
     def __init__(self, skipPids, **kw):
         # Load the parameters
@@ -161,10 +138,10 @@ class Stream():
         # Prepare the file / udp
         kw = self.kw
         if "path" in kw:
-            read = read_file(kw["path"])
+            read = iotools.read_file(kw["path"])
             fSize = getsize(kw["path"]) // 188
         elif "ip" in kw and "port" in kw:
-            read = read_udp(kw["ip"], kw["port"])
+            read = iotools.read_udp(kw["ip"], kw["port"])
             fSize = float("inf")
         else:
             print(RFMT % "Not enough paramaters given")
