@@ -36,7 +36,7 @@ for i in range(256):
 def crc32(b):
     value = crcBigMask
     for i in b:
-        value = ((value << 8) ^ crcTable[((value >> 24) ^ i) & 0xFF]) & crcBigMask
+        value = ((value << 8) ^ crcTable[(value >> 24) ^ i]) & crcBigMask
     return value
 
 
@@ -151,7 +151,7 @@ class Stream():
 
     def inf(self, s):
         self.log.append(s)
-    
+
     def ignore_pid(self, pid):
         self.skipPids.add(pid)
         self.packets.pop(pid, None)
