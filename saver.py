@@ -2,7 +2,7 @@
 from os.path import getsize
 from itertools import count
 import iotools
-from common import loop
+import tstools
 
 PFMT = "\033[46m[%04d]\033[0m<\033[92m%.3f%%\033[0m>"
 RFMT = "\033[1m\033[91m%s\033[0m"
@@ -23,7 +23,7 @@ def parse(**kw):
         every *= fSize // 99.9 * 100
     writer = iotools.Writer(iotools.write_file_queue(out))
     write = writer.queue.append
-    for i, packet in zip(count(0, 100), loop(**kw)):
+    for i, packet in zip(count(0, 100), tstools.loop(**kw)):
         if not i % every:
             pid = ((packet[1] & 0x1F) << 8) + packet[2]
             print(PFMT % (pid, i / fSize))
