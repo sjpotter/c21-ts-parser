@@ -6,6 +6,7 @@ from itertools import count
 from logging import exception
 from time import gmtime
 import iotools
+import tstools
 
 PFMT = ("\033[46m[%04d]\033[0m\033[36m(%02d)\033[0m %d|%d|%d "
         "%d <\033[92m%.3f%%\033[0m>")
@@ -16,97 +17,6 @@ PES_WITH_EXTENSION.update(range(0xC0, 0xDF + 1))
 PES_WITH_EXTENSION.update(range(0xE0, 0xEF + 1))
 EIT_ACTUAL = set([0x4E])
 EIT_ACTUAL.update(range(0x50, 0x5F + 1))
-MJD_TO_UNIX = 40588
-DAY = 86400
-crcPol = 0x04c11db7
-crcTable = []
-crcBigMask = 0xFFFFFFFF
-crcSmallMask = 0x80000000
-for i in range(256):
-    rev = i << 24
-    for j in range(8):
-        if rev & crcSmallMask:
-            rev = (rev << 1) ^ crcPol
-        else:
-            rev <<= 1
-    crcTable.append(rev & crcBigMask)
-
-
-def crc32(b):
-    value = crcBigMask
-    for i in b:
-        value = ((value << 8) ^ crcTable[(value >> 24) ^ i]) & crcBigMask
-    return value
-
-
-class CException(Exception):
-    """Custom Exception"""
-    pass
-
-
-def try_decode(b):
-    """Try to decode without throwing any error"""
-    try:
-        return b.decode()
-    except UnicodeDecodeError:
-        return "".join(chr(i) for i in b)
-
-
-def toBits(b):
-    """Return an 8 items list containing each bit in a byte"""
-    return ((b & 0x80) >> 7, (b & 0x40) >> 6, (b & 0x20) >> 5, (b & 0x10) >> 4,
-            (b & 0x08) >> 3, (b & 0x04) >> 2, (b & 0x02) >> 1, b & 0x01)
-
-
-def parse_mjd(b):
-    toUnix = ((b[0] << 8) + b[1] - MJD_TO_UNIX + 1) * DAY
-    toTime = gmtime(toUnix)
-    return (toTime.tm_year, toTime.tm_mon, toTime.tm_mday)
-
-
-def parse_bcd(b):
-    return tuple(int(hex(b[i])[2:]) for i in range(3))
-
-
-def parse_timestamp_2(b):
-    """0123456701234567012345670123456701234567 (5 bytes)
-       --***-***************-***************---"""
-    return (((b[0] & 0x38) << 30) + ((b[0] & 0x03) << 28) +
-            (b[1] << 20) +
-            ((b[2] & 0xF8) << 15) + ((b[2] & 0x03) << 13) +
-            (b[3] << 5) +
-            ((b[4] & 0xF8) >> 3))
-
-
-def parse_based_timestamp_2(b):
-    """6 bytes. ~5 bytes of base and ~2 of extension"""
-    base = parse_timestamp_2(b)
-    extension = ((b[4] & 0x03) << 7) + ((b[5] & 0xFE) >> 1)
-    return base * 300 + extension
-
-
-def parse_pcr(b):
-    base = (b[0] << 25) + (b[1] << 17) + (b[2] << 11) + (b[3] << 3) + b[4] >> 5
-    extension = ((b[4] & 0x01) << 8) + b[5]
-    return base * 300 + extension
-
-
-def parse_crc(b):
-    """Parse a 32 bit CRC"""
-    return (b[0] << 24) + (b[1] << 16) + (b[2] << 8) + b[3]
-
-
-def parse_descriptors(data, length):
-    """Return data cut from length and descriptors as pairs (tag, data)"""
-    out = []
-    while length:
-        dTag = data[0]
-        dLength = data[1]
-        dData = data[2:dLength + 2]
-        length -= dLength + 2
-        data = data[dLength + 2:]
-        out.append((dTag, dData))
-    return data, out
 
 
 class Stream():
@@ -176,7 +86,7 @@ class Stream():
                 if i // 100 == fSize:
                     break
             if sync != 0x47:
-                raise CException("Sync should be 0x47, it is 0x%x" % sync)
+                raise Exception("Sync should be 0x47, it is 0x%x" % sync)
             flagsAndPid = read(2)
             pid = ((flagsAndPid[0] & 0x1F) << 8) + flagsAndPid[1]
             if pid in skipPids:
@@ -235,14 +145,14 @@ class Stream():
                 [0] discontinuity, [1] rai, [2] streamPriority, [3] pcr,
                 [4] opcr, [5] splice, [6] private, [7] extension"""
         s_inf = self.inf
-        flags = toBits(data[0])
+        flags = tstools.toBits(data[0])
         s_inf("   ADAPTATION (%03d) %d|%d|%d|%d|%d|%d|%d|%d" %
               (len(data), *flags))
         if flags[3]:
-            pcr = parse_pcr(data[1:7])
+            pcr = tstools.parse_pcr(data[1:7])
             s_inf("   PCR -> %d" % pcr)
             if flags[4]:
-                opcr = parse_pcr(data[7:13])
+                opcr = tstools.parse_pcr(data[7:13])
                 s_inf("   OPCR -> %d" % opcr)
         # Rest of the data is ignored
 
@@ -295,15 +205,15 @@ class Stream():
             if self.hideTdt:
                 self.cShow = False
             data = data[-5:]
-            date = parse_mjd(data)
-            time = parse_bcd(data[2:])
+            date = tstools.parse_mjd(data)
+            time = tstools.parse_bcd(data[2:])
             s_inf("   TDT: Actual time is %d:%d:%d %d/%d/%d" % (*date, *time))
             self.td = (*date, *time)
             return
         # Check CRC32
-        originalCrc = parse_crc(data[-4:])
+        originalCrc = tstools.parse_crc(data[-4:])
         data = data[:-4]
-        myCrc = crc32(data)
+        myCrc = tstools.crc32(data)
         if originalCrc != myCrc:
             s_inf(RFMT % ("   CRC32 does not match: o{%d} m{%d}" %
                   (originalCrc, myCrc)))
@@ -341,7 +251,7 @@ class Stream():
             self.pcr[self.cProgram] = pcrPid
             # Parse program descriptors
             programLength = ((data[2] & 0x03) << 8) + data[3]
-            data, programD = parse_descriptors(data[4:], programLength)
+            data, programD = tstools.parse_descriptors(data[4:], programLength)
             for dTag, dData in programD:
                 s_inf("      PMT TAG[%d]: %s" % (dTag, str(dData)))
             while data:
@@ -352,7 +262,7 @@ class Stream():
                 s_inf("      PMT[%d]: (%d, %d)" % (self.cProgram, sType, ePid))
                 # Parse ES descriptors
                 esLength = ((data[3] & 0x03) << 8) + data[4]
-                data, esD = parse_descriptors(data[5:], esLength)
+                data, esD = tstools.parse_descriptors(data[5:], esLength)
                 for dTag, dData in esD:
                     s_inf("      PMT TAG[%d]: %s" % (dTag, str(dData)))
         elif cPid == 17:  # SDT
@@ -367,13 +277,13 @@ class Stream():
                 s_inf("      SDT[%d] running: %d" % (serviceId, running))
                 # Parse descriptors
                 length = ((data[3] & 0x0F) << 8) + data[4]
-                data, descriptors = parse_descriptors(data[5:], length)
+                data, descriptors = tstools.parse_descriptors(data[5:], length)
                 for dTag, dData in descriptors:
                     if dTag == 72:  # Service descriptor
                         serviceType = dData[0]
                         _length = dData[1]
-                        serviceProvider = try_decode(dData[2:_length + 2])
-                        serviceName = try_decode(dData[_length + 3:])
+                        serviceProvider = tstools.try_decode(dData[2:_length + 2])
+                        serviceName = tstools.try_decode(dData[_length + 3:])
                         self.sdt[serviceId] = (serviceType, serviceProvider,
                                                serviceName)
                     elif dTag == 93:  # Multilingual
@@ -392,9 +302,9 @@ class Stream():
             while data:
                 # Parse headers
                 eventId = (data[0] << 8) + data[1]
-                date = parse_mjd(data[2:])
-                hour = parse_bcd(data[4:])
-                duration = parse_bcd(data[7:])
+                date = tstools.parse_mjd(data[2:])
+                hour = tstools.parse_bcd(data[4:])
+                duration = tstools.parse_bcd(data[7:])
                 running = (data[10] & 0xE0) >> 5
                 s_inf("      EIT[%d] running: %d" % (eventId, running))
                 s_inf("      .      %d-%d-%d %d:%d:%d (%d:%d:%d)" %
@@ -403,19 +313,19 @@ class Stream():
                          "hour": hour, "duration": duration, "streams": []}
                 # Parse descriptors
                 length = ((data[10] & 0x0F) << 8) + data[11]
-                data, descriptors = parse_descriptors(data[12:], length)
+                data, descriptors = tstools.parse_descriptors(data[12:], length)
                 for dTag, dData in descriptors:
                     if dTag == 77:  # Info
-                        lang = try_decode(dData[:3])
+                        lang = tstools.try_decode(dData[:3])
                         _length = dData[3]
-                        eventName = try_decode(dData[4:_length + 4])
-                        text = try_decode(dData[_length + 5:])
+                        eventName = tstools.try_decode(dData[4:_length + 4])
+                        text = tstools.try_decode(dData[_length + 5:])
                         event["info"] = ";".join((lang, eventName, text))
                     elif dTag == 78:  # Extended
                         number = (dData[0] & 0xF0) >> 4
-                        lang = try_decode(dData[1:4])
+                        lang = tstools.try_decode(dData[1:4])
                         offset = dData[4] + 6
-                        text = try_decode(dData[offset:])
+                        text = tstools.try_decode(dData[offset:])
                         if number == 0:
                             t = ";".join((lang, text))
                             event["extended"] = t + event["extended"]
@@ -423,7 +333,7 @@ class Stream():
                             event["extended"] += text
                     elif dTag == 80:  # Component
                         content = dData[0] & 0x0F
-                        lang = try_decode(dData[3:6])
+                        lang = tstools.try_decode(dData[3:6])
                         event["streams"].append((lang, content))
                     else:
                         s_inf("      EIT TAG[%d]: %s" % (dTag, str(dData)))
