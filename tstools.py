@@ -92,6 +92,41 @@ def parse_descriptors(data, length):
     return data, out
 
 
+def parse_PAT(data):
+    pat = {}
+    # Get headers
+    length = ((data[1] & 0x0F) << 8) + data[2] + 3
+    if length < len(data):
+        data = data[:length]
+    data = data[8:-4]
+    # Associate program numbers to PIDs
+    for i in range(0, len(data), 4):
+        programNum = (data[i] << 8) + data[i + 1]
+        programPid = ((data[i + 2] & 0x1F) << 8) + data[i + 3]
+        pat[programPid] = programNum
+    return pat
+
+
+def parse_PMT(data):
+    pmt = []
+    # Get headers
+    length = ((data[1] & 0x0F) << 8) + data[2] + 3
+    if length < len(data):
+        data = data[:length]
+    data = data[8:-4]
+    # Parse program descriptors
+    programLength = ((data[2] & 0x03) << 8) + data[3]
+    data, _ = parse_descriptors(data[4:], programLength)
+    while data:
+        # Get pid of the ES
+        ePid = ((data[1] & 0x1F) << 8) + data[2]
+        pmt.append(ePid)
+        # Parse ES descriptors
+        esLength = ((data[3] & 0x03) << 8) + data[4]
+        data, _ = parse_descriptors(data[5:], esLength)
+    return pmt
+
+
 def loop(**kw):
     """Loop the stream and yield packets"""
     if "targetPids" in kw:
@@ -121,28 +156,55 @@ def loop(**kw):
             continue
         yield b"\x47" + flagsAndPid + read(185)
 
+
 def parsed_loop(**kw):
     """Extract and list basic information from the packets"""
     for packet in loop(**kw):
         pid = ((packet[1] & 0x1F) << 8) + packet[2]
-        tei = (packet[1] & 0x80) >> 7
-        pusi = (packet[1] & 0x40) >> 6
-        priority = (packet[1] & 0x20) >> 5
-        tsc = (packet[3] & 0xC0) >> 6
-        counter = packet[3] & 0x0F
-        yield (pid, tei, pusi, priority, tsc, counter, packet[4:])
+        pusi = packet[1] & 0x40
+        pF = packet[3] & 0x10
+        aF = packet[3] & 0x20
+        yield (pid, pusi, pF, aF, packet)
+
+
+def store_PSI(**kw):
+    """Store and yield PSI data"""
+    packets = {}
+    for pid, pusi, pF, aF, packet in parsed_loop(**kw):
+        if not pF:
+            continue
+        offset = 4
+        if aF:  # Skip adaptation field
+            length = packet[4]
+            offset += 1 + length
+        data = packet[offset:]
+        if pusi:
+            if data[0] | data[1] == 0 and data[2] == 1:  # PES
+                continue
+            elif (data[0] == 0x47 and data[1] | 0x80 == 0xE0 and
+                  data[2] == 0x0F):  # DVB-MIP
+                continue
+            else:  # PSI
+                if pid in packets:
+                    yield packets[pid]
+                packets[pid] = data[data[0] + 1:]
+        else:
+            try:
+                packets[pid] += data
+            except KeyError:
+                pass  # Incomplete data does not match previous PID
+
 
 def filter_PES(**kw):
     """Like loop() but only yields PES packets"""
-    for packet in loop(**kw):
-        # If not payload flag and pusi continue
-        if not (packet[3] & 0x10 and packet[1] & 0x40):
+    for _, _, pF, aF, packet in parsed_loop(**kw):
+        if not pF:
             continue
         offset = 4
-        if packet[3] & 0x20:  # Adaptation flag
+        if aF:  # Skip adaptation field
             length = packet[4]
             offset += 1 + length
         if not (packet[offset] | packet[offset + 1] == 0 and
-                packet[offset + 2] == 1):
+                packet[offset + 2] == 1):  # Not PES
             continue
         yield packet
